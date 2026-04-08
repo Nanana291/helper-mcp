@@ -2,14 +2,21 @@ import path from 'node:path';
 import {
   appendBrainNote,
   buildBrainSnapshot,
+  buildBrainGraph,
   brainHistory,
+  diffBrainSnapshot,
+  archiveBrainNote,
   deleteBrainNote,
   exportBrainToMarkdown,
   importBrainNotes,
   listBrainNotes,
   loadBrainSnapshot,
   mergeBrainNotes,
+  pruneDuplicateBrainNotes,
   promoteBrainNote,
+  queryBrainAdvanced,
+  linkBrainNotes,
+  restoreBrainDiff,
   searchBrainNotes,
   tagBrainNote,
   teachBrainLesson,
@@ -17,10 +24,14 @@ import {
 } from './brain.mjs';
 import {
   analyzeLuauText,
+  analyzeLuauFlow,
+  analyzeLuauTaint,
   buildLuauDependencyMap,
   buildLuauMigrationChangelog,
+  buildLuauModuleGraph,
   buildLuauRemoteGraph,
   compareLuauFiles,
+  diffLuauWithContext,
   diffLuauFiles,
   decompileLuauHeuristics,
   extractFlagsFromText,
@@ -30,21 +41,33 @@ import {
   generateLuauTemplate,
   hotfixLuauText,
   migrationChecklist,
+  mapLuauHandlers,
   patternSearchLuau,
   profileLuauPerformance,
   repairLuauRisk,
+  scoreLuauRisk,
   scoreLuauComplexity,
+  summarizeLuauSurface,
+  suggestLuauRefactor,
   scanLuauSecurity,
   scanLuauWorkspace,
   writeLuauHotfixSnapshots,
 } from './luau.mjs';
 import { buildConfigValidationMarkdown, saveConfigValidation, validateConfigFile } from './config.mjs';
 import { captureLuauMetrics } from './metrics.mjs';
-import { captureWorkspaceBaseline, generateWorkspaceChangelog } from './workspace.mjs';
+import {
+  captureWorkspaceBaseline,
+  diffWorkspaceState,
+  generateWorkspaceChangelog,
+  generateWorkspaceReleaseNotes,
+  restoreWorkspaceSnapshot,
+  rollbackWorkspaceSnapshot,
+  validateWorkspaceRelease,
+} from './workspace.mjs';
 import { readText, toPosix, writeText } from './fs.mjs';
 
 export const serverName = 'helper-mcp';
-export const serverVersion = '0.6.0';
+export const serverVersion = '0.6.1';
 
 function jsonText(value) {
   return JSON.stringify(value, null, 2);
@@ -114,6 +137,7 @@ function workspaceCoverage(workspaceRoot) {
 
 function workspaceAudit(workspaceRoot) {
   const scan = scanLuauWorkspace(workspaceRoot);
+  const coverage = workspaceCoverage(workspaceRoot);
   const actions = [];
   let totalRemotes = 0;
   let remotesWithPcall = 0;
@@ -152,6 +176,8 @@ function workspaceAudit(workspaceRoot) {
     summary: {
       totalFiles: scan.totalFiles,
       filesWithRisks: scan.files.filter((f) => f.summary.riskCount > 0).length,
+      coveredFiles: coverage.coveredFiles,
+      uncoveredFiles: coverage.uncoveredFiles,
       totalRisks: scan.totalRisks,
       pcallCoverage: `${pcallCoverage}%`,
       avgLocalPressure: `${avgLocalPressure}%`,
@@ -166,11 +192,12 @@ function workspaceAudit(workspaceRoot) {
 function toolAnnotations(canonicalName) {
   const readOnlyTools = new Set([
     'healthcheck',
-    'workspace.summary', 'workspace.risks', 'workspace.coverage', 'workspace.audit',
-    'brain.search', 'brain.snapshot', 'brain.list', 'brain.export', 'brain.history',
+    'workspace.summary', 'workspace.risks', 'workspace.coverage', 'workspace.audit', 'workspace.diff', 'workspace.validate', 'workspace.release_notes',
+    'brain.search', 'brain.snapshot', 'brain.list', 'brain.export', 'brain.history', 'brain.graph', 'brain.query_advanced', 'brain.diff', 'brain.restore_diff',
     'luau.scan', 'luau.inspect', 'luau.compare', 'luau.diff', 'luau.pattern',
     'luau.flags', 'luau.ui_map', 'luau.migration',
     'luau.decompile', 'luau.security_scan', 'luau.performance_profile', 'luau.dependencies', 'luau.remotes', 'luau.complexity',
+    'luau.taint', 'luau.flow', 'luau.handlers', 'luau.surface', 'luau.refactor', 'luau.modulegraph', 'luau.risk_score', 'luau.diff_context',
   ]);
   const readOnly = readOnlyTools.has(canonicalName);
   return {
@@ -352,6 +379,105 @@ const toolDefinitions = [
     inputSchema: { type: 'object', properties: {}, additionalProperties: false },
   },
   {
+    canonicalName: 'brain.graph',
+    aliases: ['brain.graph', 'brain_graph'],
+    description: 'Build a graph of brain notes linked by tags, similarity, source paths, and explicit links.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        limit: { type: 'number' },
+      },
+      additionalProperties: false,
+    },
+  },
+  {
+    canonicalName: 'brain.query_advanced',
+    aliases: ['brain.query_advanced', 'brain_query_advanced'],
+    description: 'Rank notes with richer filters for status, scope, tags, and time windows.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        query: { type: 'string' },
+        status: { type: 'string' },
+        scope: { type: 'string' },
+        tag: { type: 'string' },
+        from: { type: 'string' },
+        to: { type: 'string' },
+        limit: { type: 'number' },
+      },
+      additionalProperties: false,
+    },
+  },
+  {
+    canonicalName: 'brain.link',
+    aliases: ['brain.link', 'brain_link'],
+    description: 'Create explicit relationships between two brain notes.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        fromId: { type: 'string' },
+        toId: { type: 'string' },
+        relation: { type: 'string' },
+      },
+      required: ['fromId', 'toId'],
+      additionalProperties: false,
+    },
+  },
+  {
+    canonicalName: 'brain.archive',
+    aliases: ['brain.archive', 'brain_archive'],
+    description: 'Archive a brain note without deleting its history.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        id: { type: 'string' },
+        reason: { type: 'string' },
+      },
+      required: ['id'],
+      additionalProperties: false,
+    },
+  },
+  {
+    canonicalName: 'brain.restore_diff',
+    aliases: ['brain.restore_diff', 'brain_restore_diff'],
+    description: 'Compare a previous brain snapshot to the current state and return the diff.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        snapshotPath: { type: 'string' },
+      },
+      required: ['snapshotPath'],
+      additionalProperties: false,
+    },
+  },
+  {
+    canonicalName: 'brain.diff',
+    aliases: ['brain.diff', 'brain_diff'],
+    description: 'Compare the current brain snapshot to a saved snapshot and summarize drift.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        snapshotPath: { type: 'string' },
+      },
+      required: ['snapshotPath'],
+      additionalProperties: false,
+    },
+  },
+  {
+    canonicalName: 'brain.prune_duplicates',
+    aliases: ['brain.prune_duplicates', 'brain_prune_duplicates'],
+    description: 'Find or consolidate duplicate brain notes using similarity scoring.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        apply: { type: 'boolean' },
+        limit: { type: 'number' },
+        threshold: { type: 'number' },
+      },
+      additionalProperties: false,
+    },
+  },
+  {
     canonicalName: 'brain.history',
     aliases: ['brain.history', 'brain_history'],
     description: 'Show brain notes ordered by updatedAt with status changes.',
@@ -472,6 +598,106 @@ const toolDefinitions = [
     },
   },
   {
+    canonicalName: 'luau.taint',
+    aliases: ['luau.taint', 'luau_taint'],
+    description: 'Trace risky values from source to sink across a Luau file or workspace slice.',
+    inputSchema: {
+      type: 'object',
+      properties: { filePath: { type: 'string' } },
+      required: ['filePath'],
+      additionalProperties: false,
+    },
+  },
+  {
+    canonicalName: 'luau.flow',
+    aliases: ['luau.flow', 'luau_flow'],
+    description: 'Summarize simple data flow between locals, functions, and remote calls.',
+    inputSchema: {
+      type: 'object',
+      properties: { filePath: { type: 'string' } },
+      required: ['filePath'],
+      additionalProperties: false,
+    },
+  },
+  {
+    canonicalName: 'luau.handlers',
+    aliases: ['luau.handlers', 'luau_handlers'],
+    description: 'Map remote events/functions to likely handlers and missing coverage.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        targetPath: { type: 'string' },
+      },
+      additionalProperties: false,
+    },
+  },
+  {
+    canonicalName: 'luau.surface',
+    aliases: ['luau.surface', 'luau_surface'],
+    description: 'Summarize the external surface of a script or workspace slice.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        targetPath: { type: 'string' },
+      },
+      additionalProperties: false,
+    },
+  },
+  {
+    canonicalName: 'luau.refactor',
+    aliases: ['luau.refactor', 'luau_refactor'],
+    description: 'Suggest conservative refactor steps for high-confidence Luau risks.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        filePath: { type: 'string' },
+        riskLabel: { type: 'string' },
+      },
+      required: ['filePath'],
+      additionalProperties: false,
+    },
+  },
+  {
+    canonicalName: 'luau.modulegraph',
+    aliases: ['luau.modulegraph', 'luau_modulegraph'],
+    description: 'Build a module dependency graph for a Luau workspace slice.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        targetPath: { type: 'string' },
+      },
+      additionalProperties: false,
+    },
+  },
+  {
+    canonicalName: 'luau.risk_score',
+    aliases: ['luau.risk_score', 'luau_risk_score'],
+    description: 'Produce a normalized Luau risk score from risks, remotes, cleanup gaps, and taint signals.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        filePath: { type: 'string' },
+      },
+      required: ['filePath'],
+      additionalProperties: false,
+    },
+  },
+  {
+    canonicalName: 'luau.diff_context',
+    aliases: ['luau.diff_context', 'luau_diff_context'],
+    description: 'Diff two Luau files with surrounding context and a concise structural summary.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        pathA: { type: 'string' },
+        pathB: { type: 'string' },
+        context: { type: 'number' },
+      },
+      required: ['pathA', 'pathB'],
+      additionalProperties: false,
+    },
+  },
+  {
     canonicalName: 'luau.repair',
     aliases: ['luau.repair', 'luau_repair'],
     description: 'Suggest a targeted fix snippet for a Luau risk label.',
@@ -560,6 +786,54 @@ const toolDefinitions = [
       name: { type: 'string' },
       outputPath: { type: 'string' },
     },
+    additionalProperties: false,
+  }),
+  toolDefinition('workspace.diff', ['workspace.diff', 'workspace_diff'], 'Compare current workspace state to a baseline and summarize drift.', {
+    type: 'object',
+    properties: {
+      baselinePath: { type: 'string' },
+      targetPath: { type: 'string' },
+    },
+    required: ['baselinePath'],
+    additionalProperties: false,
+  }),
+  toolDefinition('workspace.rollback', ['workspace.rollback', 'workspace_rollback'], 'Restore a file or workspace snapshot from a saved artifact.', {
+    type: 'object',
+    properties: {
+      snapshotPath: { type: 'string' },
+      targetPath: { type: 'string' },
+      apply: { type: 'boolean' },
+    },
+    required: ['snapshotPath'],
+    additionalProperties: false,
+  }),
+  toolDefinition('workspace.validate', ['workspace.validate', 'workspace_validate'], 'Validate that the current workspace still matches the expected release shape.', {
+    type: 'object',
+    properties: {
+      baselinePath: { type: 'string' },
+      targetPath: { type: 'string' },
+    },
+    required: ['baselinePath'],
+    additionalProperties: false,
+  }),
+  toolDefinition('workspace.release_notes', ['workspace.release_notes', 'workspace_release_notes'], 'Generate human-readable release notes from diffs, brain links, and snapshots.', {
+    type: 'object',
+    properties: {
+      baselinePath: { type: 'string' },
+      targetPath: { type: 'string' },
+      title: { type: 'string' },
+    },
+    required: ['baselinePath'],
+    additionalProperties: false,
+  }),
+  toolDefinition('workspace.restore_snapshot', ['workspace.restore_snapshot', 'workspace_restore_snapshot'], 'Restore a named snapshot and verify the post-restore state.', {
+    type: 'object',
+    properties: {
+      snapshotPath: { type: 'string' },
+      targetPath: { type: 'string' },
+      apply: { type: 'boolean' },
+    },
+    required: ['snapshotPath'],
     additionalProperties: false,
   }),
   toolDefinition('workspace.baseline', ['workspace.baseline', 'workspace_baseline'], 'Capture a regression baseline for a workspace or script path.', {
@@ -778,6 +1052,44 @@ export function handleTool(workspaceRoot, requestedName, args = {}) {
 
     case 'brain.export': return textResult(exportBrainToMarkdown(workspaceRoot));
 
+    case 'brain.graph': {
+      return textResult(jsonText(buildBrainGraph(workspaceRoot, { limit: args.limit })));
+    }
+
+    case 'brain.query_advanced': {
+      return textResult(jsonText(queryBrainAdvanced(workspaceRoot, args.query || '', {
+        status: args.status,
+        scope: args.scope,
+        tag: args.tag,
+        from: args.from,
+        to: args.to,
+        limit: args.limit,
+      })));
+    }
+
+    case 'brain.link': {
+      return textResult(jsonText(linkBrainNotes(workspaceRoot, args.fromId, args.toId, args.relation)));
+    }
+
+    case 'brain.archive': {
+      return textResult(jsonText(archiveBrainNote(workspaceRoot, args.id, { reason: args.reason })));
+    }
+
+    case 'brain.restore_diff': {
+      return textResult(jsonText(restoreBrainDiff(workspaceRoot, args.snapshotPath)));
+    }
+    case 'brain.diff': {
+      return textResult(jsonText(diffBrainSnapshot(workspaceRoot, args.snapshotPath)));
+    }
+
+    case 'brain.prune_duplicates': {
+      return textResult(jsonText(pruneDuplicateBrainNotes(workspaceRoot, {
+        apply: args.apply === true,
+        limit: args.limit,
+        threshold: args.threshold,
+      })));
+    }
+
     case 'luau.scan': return textResult(jsonText(scanLuauWorkspace(workspaceRoot)));
 
     case 'luau.inspect': {
@@ -812,6 +1124,42 @@ export function handleTool(workspaceRoot, requestedName, args = {}) {
       const result = migrationChecklist(workspaceRoot, args.oldPath, args.newPath);
       const note = storeMigrationBrainNote(workspaceRoot, result, args.oldPath, args.newPath);
       return textResult(jsonText({ ...result, brainNote: note }));
+    }
+
+    case 'luau.taint': {
+      const resolved = resolveFilePath(workspaceRoot, args.filePath);
+      return textResult(jsonText(analyzeLuauTaint(readText(resolved), resolved)));
+    }
+
+    case 'luau.flow': {
+      const resolved = resolveFilePath(workspaceRoot, args.filePath);
+      return textResult(jsonText(analyzeLuauFlow(readText(resolved), resolved)));
+    }
+
+    case 'luau.handlers': {
+      return textResult(jsonText(mapLuauHandlers(workspaceRoot, args.targetPath || '')));
+    }
+
+    case 'luau.surface': {
+      return textResult(jsonText(summarizeLuauSurface(workspaceRoot, args.targetPath || '')));
+    }
+
+    case 'luau.refactor': {
+      const resolved = resolveFilePath(workspaceRoot, args.filePath);
+      return textResult(jsonText(suggestLuauRefactor(readText(resolved), resolved, args.riskLabel)));
+    }
+
+    case 'luau.modulegraph': {
+      return textResult(jsonText(buildLuauModuleGraph(workspaceRoot, args.targetPath || '')));
+    }
+
+    case 'luau.risk_score': {
+      const resolved = resolveFilePath(workspaceRoot, args.filePath);
+      return textResult(jsonText(scoreLuauRisk(readText(resolved), resolved)));
+    }
+
+    case 'luau.diff_context': {
+      return textResult(jsonText(diffLuauWithContext(workspaceRoot, args.pathA, args.pathB, { context: args.context })));
     }
 
     case 'luau.note': {
@@ -897,6 +1245,44 @@ export function handleTool(workspaceRoot, requestedName, args = {}) {
       return textResult(jsonText(captureLuauMetrics(workspaceRoot, {
         label: args.label,
         record: args.record !== false,
+      })));
+    }
+
+    case 'workspace.diff': {
+      return textResult(jsonText(diffWorkspaceState(workspaceRoot, {
+        baselinePath: args.baselinePath,
+        targetPath: args.targetPath || '',
+      })));
+    }
+
+    case 'workspace.rollback': {
+      return textResult(jsonText(rollbackWorkspaceSnapshot(workspaceRoot, {
+        snapshotPath: args.snapshotPath,
+        targetPath: args.targetPath || '',
+        apply: args.apply !== false,
+      })));
+    }
+
+    case 'workspace.validate': {
+      return textResult(jsonText(validateWorkspaceRelease(workspaceRoot, {
+        baselinePath: args.baselinePath,
+        targetPath: args.targetPath || '',
+      })));
+    }
+
+    case 'workspace.release_notes': {
+      return textResult(jsonText(generateWorkspaceReleaseNotes(workspaceRoot, {
+        baselinePath: args.baselinePath,
+        targetPath: args.targetPath || '',
+        title: args.title || 'Workspace release notes',
+      })));
+    }
+
+    case 'workspace.restore_snapshot': {
+      return textResult(jsonText(restoreWorkspaceSnapshot(workspaceRoot, {
+        snapshotPath: args.snapshotPath,
+        targetPath: args.targetPath || '',
+        apply: args.apply !== false,
       })));
     }
 

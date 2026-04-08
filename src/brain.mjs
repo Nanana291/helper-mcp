@@ -64,6 +64,61 @@ function compareNoteText(a, b) {
   return overlap / Math.max(leftTokens.size, rightTokens.size, 1);
 }
 
+function loadBrainEvents(root) {
+  const { history } = brainPaths(root);
+  if (!fs.existsSync(history)) {
+    return [];
+  }
+  return readText(history)
+    .split(/\r?\n/)
+    .map((line) => line.trim())
+    .filter(Boolean)
+    .map((line) => {
+      try {
+        return JSON.parse(line);
+      } catch {
+        return null;
+      }
+    })
+    .filter(Boolean);
+}
+
+function saveBrainGraphNotes(root, notes) {
+  rebuildNotesFile(root, notes);
+  return rebuildCurrentSnapshot(root, notes);
+}
+
+function buildNoteGraph(notes) {
+  const nodes = notes.map((note) => ({
+    id: note.id,
+    title: note.title,
+    scope: note.scope,
+    status: note.status,
+    tags: Array.isArray(note.tags) ? note.tags : [],
+    sourcePath: note.sourcePath || '',
+    updatedAt: note.updatedAt || note.createdAt || '',
+  }));
+  const edges = [];
+  for (let i = 0; i < notes.length; i += 1) {
+    for (let j = i + 1; j < notes.length; j += 1) {
+      const left = notes[i];
+      const right = notes[j];
+      const similarity = compareNoteText(left, right);
+      if (left.sourcePath && right.sourcePath && left.sourcePath === right.sourcePath) {
+        edges.push({ from: left.id, to: right.id, relation: 'same-source', weight: 1 });
+      } else if (similarity >= 0.45) {
+        edges.push({ from: left.id, to: right.id, relation: 'similar', weight: Number(similarity.toFixed(2)) });
+      }
+      for (const link of Array.isArray(left.links) ? left.links : []) {
+        if (link?.id === right.id) {
+          edges.push({ from: left.id, to: right.id, relation: link.relation || 'linked', weight: 1 });
+        }
+      }
+    }
+  }
+  return { nodes, edges };
+}
+
 export function summarizeBrainNotes(notes) {
   const counts = {
     total: notes.length,
@@ -114,6 +169,11 @@ export function appendBrainNote(root, note) {
     tags: Array.isArray(note.tags) ? note.tags.map(String).map((tag) => tag.trim()).filter(Boolean) : [],
     sourcePath: String(note.sourcePath || '').trim(),
     evidence: String(note.evidence || '').trim(),
+    links: Array.isArray(note.links) ? note.links.map((link) => ({
+      id: String(link?.id || '').trim(),
+      relation: String(link?.relation || 'related').trim(),
+      linkedAt: String(link?.linkedAt || createdAt).trim(),
+    })).filter((link) => link.id) : [],
     createdAt,
     updatedAt: createdAt,
   };
@@ -353,6 +413,186 @@ export function brainHistory(root, { noteId = '', limit = 100 } = {}) {
       tagsAdded: entry.tagsAdded || [],
     })),
   };
+}
+
+export function buildBrainGraph(root, { limit = 100 } = {}) {
+  const notes = loadNotes(root).slice(-Math.max(1, Number(limit) || 100));
+  const graph = buildNoteGraph(notes);
+  return {
+    summary: {
+      totalNodes: graph.nodes.length,
+      totalEdges: graph.edges.length,
+      linkedNodes: graph.edges.filter((edge) => edge.relation === 'linked').length,
+      similarNodes: graph.edges.filter((edge) => edge.relation === 'similar').length,
+    },
+    nodes: graph.nodes,
+    edges: graph.edges,
+  };
+}
+
+export function queryBrainAdvanced(root, query = '', { status, scope, tag, from, to, limit = 50 } = {}) {
+  const needle = normalizeText(query);
+  let notes = loadNotes(root);
+  if (status) {
+    const wanted = String(status).trim().toLowerCase();
+    notes = notes.filter((note) => String(note.status || '').toLowerCase() === wanted);
+  }
+  if (scope) {
+    const wanted = String(scope).trim().toLowerCase();
+    notes = notes.filter((note) => String(note.scope || '').toLowerCase() === wanted);
+  }
+  if (tag) {
+    const wanted = String(tag).trim().toLowerCase();
+    notes = notes.filter((note) => Array.isArray(note.tags) && note.tags.some((entry) => String(entry).toLowerCase() === wanted));
+  }
+  if (from) {
+    const fromTime = new Date(from).getTime();
+    if (!Number.isNaN(fromTime)) {
+      notes = notes.filter((note) => new Date(note.updatedAt || note.createdAt || 0).getTime() >= fromTime);
+    }
+  }
+  if (to) {
+    const toTime = new Date(to).getTime();
+    if (!Number.isNaN(toTime)) {
+      notes = notes.filter((note) => new Date(note.updatedAt || note.createdAt || 0).getTime() <= toTime);
+    }
+  }
+
+  const scored = notes.map((note) => {
+    const haystack = normalizeText([note.title, note.summary, note.evidence, note.scope, ...(Array.isArray(note.tags) ? note.tags : [])].join(' '));
+    let score = 0;
+    if (needle && haystack.includes(needle)) score += 5;
+    if (needle && normalizeText(note.title).includes(needle)) score += 4;
+    if (needle && normalizeText(note.summary).includes(needle)) score += 3;
+    if (needle && normalizeText(note.evidence).includes(needle)) score += 2;
+    if (needle && Array.isArray(note.tags) && note.tags.some((entry) => normalizeText(entry).includes(needle))) score += 3;
+    if (String(note.status || '').toLowerCase() === 'active') score += 1;
+    if (String(note.status || '').toLowerCase() === 'archived') score -= 1;
+    return { ...note, score };
+  }).filter((note) => note.score > 0 || !needle);
+
+  return {
+    query,
+    total: scored.length,
+    notes: scored.sort((a, b) => b.score - a.score || String(b.updatedAt || '').localeCompare(String(a.updatedAt || ''))).slice(0, Math.max(1, Number(limit) || 50)),
+  };
+}
+
+export function linkBrainNotes(root, fromId, toId, relation = 'related') {
+  const notes = loadNotes(root);
+  const fromIdx = notes.findIndex((note) => note.id === fromId);
+  const toIdx = notes.findIndex((note) => note.id === toId);
+  if (fromIdx === -1) return { ok: false, error: `Note not found: ${fromId}` };
+  if (toIdx === -1) return { ok: false, error: `Note not found: ${toId}` };
+
+  const linkedAt = new Date().toISOString();
+  const relationName = String(relation || 'related').trim() || 'related';
+  const linkEntry = { id: toId, relation: relationName, linkedAt };
+  const backLink = { id: fromId, relation: relationName, linkedAt };
+  const fromLinks = Array.isArray(notes[fromIdx].links) ? notes[fromIdx].links.slice() : [];
+  const toLinks = Array.isArray(notes[toIdx].links) ? notes[toIdx].links.slice() : [];
+  if (!fromLinks.some((link) => link.id === toId)) fromLinks.push(linkEntry);
+  if (!toLinks.some((link) => link.id === fromId)) toLinks.push(backLink);
+  notes[fromIdx] = { ...notes[fromIdx], links: fromLinks, updatedAt: linkedAt };
+  notes[toIdx] = { ...notes[toIdx], links: toLinks, updatedAt: linkedAt };
+  saveBrainGraphNotes(root, notes);
+  appendBrainHistory(root, { action: 'link', fromId, toId, relation: relationName });
+  return { ok: true, from: notes[fromIdx], to: notes[toIdx] };
+}
+
+export function archiveBrainNote(root, id, { reason = '' } = {}) {
+  const notes = loadNotes(root);
+  const idx = notes.findIndex((note) => note.id === id);
+  if (idx === -1) return { ok: false, error: `Note not found: ${id}` };
+  const archivedAt = new Date().toISOString();
+  const before = notes[idx];
+  notes[idx] = { ...notes[idx], status: 'archived', archivedAt, archivedReason: String(reason || '').trim(), updatedAt: archivedAt };
+  saveBrainGraphNotes(root, notes);
+  appendBrainHistory(root, { action: 'archive', noteId: id, before, after: notes[idx], reason: String(reason || '').trim() });
+  return { ok: true, note: notes[idx] };
+}
+
+export function restoreBrainDiff(root, snapshotPath) {
+  const current = buildBrainSnapshot(root);
+  const resolved = path.isAbsolute(snapshotPath) ? snapshotPath : path.resolve(root, snapshotPath);
+  if (!fs.existsSync(resolved)) {
+    return { ok: false, error: `Snapshot not found: ${snapshotPath}` };
+  }
+  let snapshot;
+  try {
+    snapshot = JSON.parse(readText(resolved));
+  } catch {
+    return { ok: false, error: `Snapshot is not valid JSON: ${snapshotPath}` };
+  }
+  const currentById = new Map((current.notes || []).map((note) => [note.id, note]));
+  const snapshotById = new Map((snapshot.notes || []).map((note) => [note.id, note]));
+  const added = [];
+  const removed = [];
+  const changed = [];
+
+  for (const note of current.notes || []) {
+    if (!snapshotById.has(note.id)) {
+      added.push({ id: note.id, title: note.title });
+    } else {
+      const previous = snapshotById.get(note.id);
+      if (previous.status !== note.status || previous.title !== note.title || previous.summary !== note.summary) {
+        changed.push({ id: note.id, before: previous, after: note });
+      }
+    }
+  }
+  for (const note of snapshot.notes || []) {
+    if (!currentById.has(note.id)) {
+      removed.push({ id: note.id, title: note.title });
+    }
+  }
+
+  return {
+    ok: true,
+    snapshotPath: toPosix(snapshotPath),
+    summary: {
+      added: added.length,
+      removed: removed.length,
+      changed: changed.length,
+      snapshotCount: (snapshot.notes || []).length,
+      currentCount: (current.notes || []).length,
+    },
+    added,
+    removed,
+    changed,
+  };
+}
+
+export function diffBrainSnapshot(root, snapshotPath) {
+  return restoreBrainDiff(root, snapshotPath);
+}
+
+export function pruneDuplicateBrainNotes(root, { apply = false, limit = 10, threshold = 0.7 } = {}) {
+  const notes = loadNotes(root);
+  const candidates = [];
+  for (let i = 0; i < notes.length; i += 1) {
+    for (let j = i + 1; j < notes.length; j += 1) {
+      const similarity = compareNoteText(notes[i], notes[j]);
+      if (similarity >= threshold) {
+        candidates.push({
+          keepId: notes[i].id,
+          dropId: notes[j].id,
+          keepTitle: notes[i].title,
+          dropTitle: notes[j].title,
+          similarity: Number(similarity.toFixed(2)),
+        });
+      }
+    }
+  }
+  const suggestions = candidates.sort((a, b) => b.similarity - a.similarity).slice(0, Math.max(1, Number(limit) || 10));
+  if (!apply) {
+    return { ok: true, mode: 'suggest', total: suggestions.length, suggestions };
+  }
+
+  const dropIds = new Set(suggestions.map((entry) => entry.dropId));
+  const mergedNotes = notes.filter((note) => !dropIds.has(note.id));
+  saveBrainGraphNotes(root, mergedNotes);
+  appendBrainHistory(root, { action: 'prune', droppedIds: [...dropIds], keptIds: suggestions.map((entry) => entry.keepId) });
+  return { ok: true, mode: 'applied', prunedCount: dropIds.size, remainingCount: mergedNotes.length };
 }
 
 function inferTagsFromText(text) {

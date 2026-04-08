@@ -89,6 +89,31 @@ function compareEntries(currentEntries, baselineEntries) {
   return { added, removed, modified };
 }
 
+function readWorkspaceSnapshot(snapshotPath) {
+  if (!snapshotPath || !fs.existsSync(snapshotPath)) {
+    return null;
+  }
+  try {
+    return JSON.parse(readText(snapshotPath));
+  } catch {
+    return null;
+  }
+}
+
+function restoreSingleFileFromSnapshot(root, snapshot, targetPath) {
+  const resolvedTarget = targetPath ? (path.isAbsolute(targetPath) ? targetPath : path.resolve(root, targetPath)) : '';
+  const filePath = resolvedTarget || (snapshot?.filePath ? (path.isAbsolute(snapshot.filePath) ? snapshot.filePath : path.resolve(root, snapshot.filePath)) : '');
+  const content = snapshot?.content || snapshot?.before || snapshot?.report?.before || '';
+  if (!filePath || !content) {
+    return { ok: false, error: 'Snapshot does not contain restorable file content.' };
+  }
+  writeText(filePath, `${String(content).trimEnd()}\n`);
+  return {
+    ok: true,
+    filePath: toPosix(path.relative(root, filePath) || filePath),
+  };
+}
+
 export function captureWorkspaceBaseline(root, { targetPath = '', outputPath = '', label = '' } = {}) {
   const scripts = listScriptFiles(root, targetPath);
   const entries = scripts.map((filePath) => snapshotEntry(root, filePath));
@@ -208,4 +233,79 @@ export function hotfixWorkspaceFile(root, filePath, options = {}) {
     snapshotPath,
     report,
   };
+}
+
+export function diffWorkspaceState(root, { baselinePath = '', targetPath = '' } = {}) {
+  if (!baselinePath) {
+    return { ok: false, error: 'baselinePath is required.' };
+  }
+  const comparison = compareWorkspaceBaseline(root, baselinePath, { targetPath });
+  return {
+    ok: true,
+    comparison,
+    markdown: generateWorkspaceChangelog(root, baselinePath, { targetPath, title: 'Workspace diff' }).markdown,
+  };
+}
+
+export function rollbackWorkspaceSnapshot(root, { snapshotPath = '', targetPath = '', apply = true } = {}) {
+  const snapshot = readWorkspaceSnapshot(path.isAbsolute(snapshotPath) ? snapshotPath : path.resolve(root, snapshotPath));
+  if (!snapshot) {
+    return { ok: false, error: `Snapshot not found or invalid: ${snapshotPath}` };
+  }
+  if (!apply) {
+    return { ok: true, mode: 'dry-run', snapshotPath: toPosix(snapshotPath), snapshot };
+  }
+  if (snapshot.filePath || snapshot.content || snapshot.before || snapshot.report?.before) {
+    return restoreSingleFileFromSnapshot(root, snapshot, targetPath);
+  }
+  return { ok: false, error: 'Snapshot does not include file content to restore.' };
+}
+
+export function validateWorkspaceRelease(root, { baselinePath = '', targetPath = '' } = {}) {
+  if (!baselinePath) {
+    return { ok: false, error: 'baselinePath is required.' };
+  }
+  const comparison = compareWorkspaceBaseline(root, baselinePath, { targetPath });
+  const currentRisks = comparison.currentEntries.reduce((sum, entry) => sum + entry.risks, 0);
+  const baselineRisks = comparison.baselineEntries.reduce((sum, entry) => sum + entry.risks, 0);
+  const valid = comparison.diff.removed.length === 0 && comparison.diff.modified.length === 0 && comparison.diff.added.length === 0;
+  return {
+    ok: true,
+    valid,
+    summary: {
+      currentCount: comparison.currentCount,
+      baselineCount: comparison.baselineCount,
+      currentRisks,
+      baselineRisks,
+      riskDelta: currentRisks - baselineRisks,
+      added: comparison.diff.added.length,
+      removed: comparison.diff.removed.length,
+      modified: comparison.diff.modified.length,
+    },
+    comparison,
+  };
+}
+
+export function generateWorkspaceReleaseNotes(root, { baselinePath = '', targetPath = '', title = 'Workspace release notes' } = {}) {
+  if (!baselinePath) {
+    return { ok: false, error: 'baselinePath is required.' };
+  }
+  const changelog = generateWorkspaceChangelog(root, baselinePath, { targetPath, title });
+  const notes = [
+    changelog.markdown.trimEnd(),
+    '',
+    `Release target: ${targetLabel(root, targetPath)}`,
+    `Artifact: ${changelog.path}`,
+    '',
+  ].join('\n');
+  return {
+    ok: true,
+    path: changelog.path,
+    markdown: `${notes.trimEnd()}\n`,
+    comparison: changelog.comparison,
+  };
+}
+
+export function restoreWorkspaceSnapshot(root, { snapshotPath = '', targetPath = '', apply = true } = {}) {
+  return rollbackWorkspaceSnapshot(root, { snapshotPath, targetPath, apply });
 }

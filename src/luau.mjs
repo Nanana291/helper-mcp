@@ -128,6 +128,34 @@ function textHash(text) {
   return crypto.createHash('sha256').update(String(text || ''), 'utf8').digest('hex');
 }
 
+function averageConfidence(items) {
+  const values = (items || []).map((item) => Number(item?.confidence ?? item?.confidenceAverage ?? 0)).filter((value) => Number.isFinite(value));
+  if (values.length === 0) return 0;
+  return Number((values.reduce((sum, value) => sum + value, 0) / values.length).toFixed(2));
+}
+
+function resolveLuauFiles(root, targetPath = '') {
+  const normalizedTarget = targetPath
+    ? (() => {
+      const rawTarget = path.isAbsolute(targetPath) ? path.relative(root, targetPath) : targetPath;
+      return rawTarget === '.' ? '' : toPosix(rawTarget);
+    })()
+    : '';
+  return walkFiles(root, (filePath) => {
+    const ext = path.extname(filePath).toLowerCase();
+    if (!LUAU_EXTENSIONS.has(ext)) return false;
+    if (!normalizedTarget) return true;
+    const rel = toPosix(relative(root, filePath));
+    return rel === normalizedTarget || rel.startsWith(`${normalizedTarget}/`);
+  });
+}
+
+function buildContextSnippet(lines, lineNumber, context = 2) {
+  const start = Math.max(0, lineNumber - 1 - context);
+  const end = Math.min(lines.length, lineNumber + context);
+  return lines.slice(start, end).map((text, index) => ({ line: start + index + 1, text }));
+}
+
 function getPatternSet(patterns = defaultLuauPatterns) {
   return {
     callbacks: patterns.callbacks || [],
@@ -782,14 +810,7 @@ export function repairLuauRisk(text, filePath = '', riskLabel = '') {
 }
 
 export function buildLuauRemoteGraph(root, targetPath = '') {
-  const files = walkFiles(root, (filePath) => {
-    const ext = path.extname(filePath).toLowerCase();
-    if (!LUAU_EXTENSIONS.has(ext)) return false;
-    if (!targetPath) return true;
-    const rel = toPosix(relative(root, filePath));
-    const target = toPosix(targetPath);
-    return rel === target || rel.startsWith(`${target}/`);
-  });
+  const files = resolveLuauFiles(root, targetPath);
 
   const remotes = new Map();
   const register = (name, filePath, line, kind, text) => {
@@ -907,6 +928,264 @@ export function scoreLuauComplexity(text, filePath = '') {
   };
 }
 
+export function analyzeLuauTaint(text, filePath = '') {
+  const source = String(text || '');
+  const lines = source.split(/\r?\n/);
+  const taintedVariables = new Set();
+  const sources = [];
+  const sinks = [];
+  const sourceRe = /\b(HttpGetAsync|HttpGet|GetAsync|RequestAsync|loadstring|string\.char|bit32\.bxor|syn\.request|http_request)\b|https?:\/\//i;
+  const sinkRe = /:((FireServer)|(InvokeServer)|(FireClient))\s*\(|\bloadstring\s*\(|\brequire\s*\(/i;
+
+  for (let i = 0; i < lines.length; i += 1) {
+    const line = lines[i];
+    const assign = /local\s+([A-Za-z_][A-Za-z0-9_]*)\s*=\s*(.+)/.exec(line);
+    if (assign && sourceRe.test(assign[2])) {
+      taintedVariables.add(assign[1]);
+      sources.push({ line: i + 1, variable: assign[1], text: line.trim(), severity: 'high', confidence: 0.96 });
+    }
+    for (const variable of taintedVariables) {
+      if (new RegExp(`\\b${variable}\\b`).test(line) && sinkRe.test(line)) {
+        sinks.push({ line: i + 1, variable, text: line.trim(), severity: 'high', confidence: 0.94 });
+      }
+    }
+  }
+
+  return {
+    summary: {
+      filePath: toPosix(filePath),
+      sourceCount: sources.length,
+      sinkCount: sinks.length,
+      taintedVariableCount: taintedVariables.size,
+      confidenceAverage: averageConfidence([...sources, ...sinks]),
+    },
+    taintedVariables: [...taintedVariables],
+    sources,
+    sinks,
+    flows: sources.flatMap((source) => sinks.filter((sink) => sink.variable === source.variable).map((sink) => ({
+      variable: source.variable,
+      sourceLine: source.line,
+      sinkLine: sink.line,
+      severity: 'high',
+      confidence: Number(((source.confidence + sink.confidence) / 2).toFixed(2)),
+    }))),
+  };
+}
+
+export function analyzeLuauFlow(text, filePath = '') {
+  const source = String(text || '');
+  const lines = source.split(/\r?\n/);
+  const nodes = new Map();
+  const edges = [];
+
+  for (let i = 0; i < lines.length; i += 1) {
+    const line = lines[i];
+    const assign = /local\s+([A-Za-z_][A-Za-z0-9_]*)\s*=\s*([A-Za-z_][A-Za-z0-9_]*)\b/.exec(line);
+    if (assign) {
+      nodes.set(assign[1], { name: assign[1], kind: 'local', line: i + 1 });
+      nodes.set(assign[2], nodes.get(assign[2]) || { name: assign[2], kind: 'reference' });
+      edges.push({ from: assign[2], to: assign[1], line: i + 1, kind: 'assignment' });
+    }
+
+    const fn = /(?:local\s+function|function)\s+([A-Za-z_][A-Za-z0-9_\.:\[\]]*)/.exec(line);
+    if (fn) {
+      nodes.set(fn[1], { name: fn[1], kind: 'function', line: i + 1 });
+    }
+
+    const remote = /([A-Za-z_][A-Za-z0-9_]*)\s*:\s*(FireServer|InvokeServer|FireClient)\s*\(/.exec(line);
+    if (remote) {
+      nodes.set(remote[1], nodes.get(remote[1]) || { name: remote[1], kind: 'remote' });
+      edges.push({ from: remote[1], to: remote[2], line: i + 1, kind: 'remote-call' });
+    }
+  }
+
+  return {
+    summary: {
+      filePath: toPosix(filePath),
+      nodeCount: nodes.size,
+      edgeCount: edges.length,
+      localCount: lines.filter((line) => /^\s*local\s+/.test(line)).length,
+    },
+    nodes: [...nodes.values()],
+    edges,
+  };
+}
+
+export function mapLuauHandlers(root, targetPath = '') {
+  const graph = buildLuauRemoteGraph(root, targetPath);
+  return {
+    summary: {
+      fileCount: graph.summary.fileCount,
+      remoteCount: graph.summary.remoteCount,
+      handlerCount: graph.summary.handlerCount,
+      orphanedCount: graph.summary.orphanedCount,
+    },
+    remotes: graph.remotes.map((remote) => ({
+      name: remote.name,
+      kind: remote.kind,
+      files: remote.files,
+      hasServerHandler: remote.hasServerHandler,
+      hasClientHandler: remote.hasClientHandler,
+      orphaned: remote.orphaned,
+    })),
+  };
+}
+
+export function summarizeLuauSurface(root, targetPath = '') {
+  const scan = scanLuauWorkspace(root);
+  const dependencyGraph = buildLuauDependencyMap(root, targetPath);
+  const files = scan.files.map((entry) => {
+    const findings = [...entry.categories.callbacks, ...entry.categories.remotes, ...entry.categories.state, ...entry.categories.ui, ...entry.categories.risks];
+    return {
+      file: entry.filePath,
+      riskCount: entry.summary.riskCount,
+      remoteCount: entry.summary.remoteCount,
+      callbackCount: entry.summary.callbackCount,
+      confidenceAverage: averageConfidence(findings),
+    };
+  });
+
+  return {
+    summary: {
+      totalFiles: scan.totalFiles,
+      totalCallbacks: scan.totalCallbacks,
+      totalRemotes: scan.totalRemotes,
+      totalRisks: scan.totalRisks,
+      dependencyCount: dependencyGraph.summary.dependencyCount,
+      orphanedScriptCount: dependencyGraph.summary.orphanedScriptCount,
+      confidenceAverage: averageConfidence(files),
+    },
+    files,
+    dependencies: dependencyGraph,
+  };
+}
+
+export function suggestLuauRefactor(text, filePath = '', riskLabel = '') {
+  const repair = repairLuauRisk(text, filePath, riskLabel);
+  return {
+    summary: {
+      ...repair.summary,
+      confidence: repair.summary.riskLabel ? 0.9 : 0.7,
+    },
+    explanation: repair.explanation,
+    before: repair.before,
+    after: repair.after,
+    snippet: repair.snippet,
+  };
+}
+
+export function buildLuauModuleGraph(root, targetPath = '') {
+  const graph = buildLuauDependencyMap(root, targetPath);
+  const modules = graph.scripts.map((script) => ({
+    path: script.path,
+    hash: script.hash,
+    requires: script.requires,
+    unusedImports: script.unusedImports,
+  }));
+  const edges = modules.flatMap((module) => module.requires.map((requireEntry) => ({
+    from: module.path,
+    to: requireEntry.target,
+    alias: requireEntry.alias,
+    line: requireEntry.line,
+  })));
+  return {
+    summary: {
+      scriptCount: graph.summary.scriptCount,
+      nodeCount: modules.length,
+      edgeCount: edges.length,
+      orphanedScriptCount: graph.summary.orphanedScriptCount,
+    },
+    modules,
+    edges,
+  };
+}
+
+export function scoreLuauRisk(text, filePath = '') {
+  const analysis = analyzeLuauText(text, filePath);
+  const security = scanLuauSecurity(text, filePath);
+  const performance = profileLuauPerformance(text, filePath);
+  const taint = analyzeLuauTaint(text, filePath);
+  const missingPcall = analysis.categories.risks.filter((risk) => risk.label === 'missing-pcall').length;
+  const score = Math.min(100, Math.round(
+    analysis.summary.riskCount * 10
+    + security.summary.findingCount * 8
+    + performance.summary.findingCount * 4
+    + taint.summary.sinkCount * 12
+    + missingPcall * 15
+    + analysis.summary.localCount / 4,
+  ));
+  return {
+    summary: {
+      filePath: toPosix(filePath),
+      score,
+      confidenceAverage: averageConfidence([
+        ...analysis.categories.risks,
+        ...security.findings,
+        ...performance.findings,
+        ...taint.sources,
+        ...taint.sinks,
+      ]),
+      riskCount: analysis.summary.riskCount,
+      securityCount: security.summary.findingCount,
+      performanceCount: performance.summary.findingCount,
+      taintCount: taint.summary.sinkCount,
+    },
+    contributions: {
+      risks: analysis.summary.riskCount * 10,
+      security: security.summary.findingCount * 8,
+      performance: performance.summary.findingCount * 4,
+      taint: taint.summary.sinkCount * 12,
+      missingPcall: missingPcall * 15,
+    },
+  };
+}
+
+export function diffLuauWithContext(root, pathA, pathB, { context = 2 } = {}) {
+  const fileA = path.isAbsolute(pathA) ? pathA : path.join(root, pathA);
+  const fileB = path.isAbsolute(pathB) ? pathB : path.join(root, pathB);
+  const textA = readText(fileA);
+  const textB = readText(fileB);
+  const linesA = textA.split(/\r?\n/);
+  const linesB = textB.split(/\r?\n/);
+  const max = Math.max(linesA.length, linesB.length);
+  const hunks = [];
+
+  for (let i = 0; i < max; i += 1) {
+    const left = linesA[i];
+    const right = linesB[i];
+    if (left === right) continue;
+    if (left !== undefined) {
+      hunks.push({
+        type: right === undefined ? 'removed' : 'changed',
+        line: i + 1,
+        before: left,
+        after: right ?? '',
+        contextBefore: buildContextSnippet(linesA, i + 1, context),
+        contextAfter: buildContextSnippet(linesB, i + 1, context),
+      });
+    } else if (right !== undefined) {
+      hunks.push({
+        type: 'added',
+        line: i + 1,
+        before: '',
+        after: right,
+        contextBefore: buildContextSnippet(linesA, i + 1, context),
+        contextAfter: buildContextSnippet(linesB, i + 1, context),
+      });
+    }
+  }
+
+  return {
+    summary: {
+      fileA: toPosix(pathA),
+      fileB: toPosix(pathB),
+      hunkCount: hunks.length,
+    },
+    structural: diffLuauFiles(root, pathA, pathB),
+    hunks,
+  };
+}
+
 export function scanLuauSecurity(text, filePath = '') {
   const source = String(text || '');
   const lines = source.split(/\r?\n/);
@@ -1014,14 +1293,7 @@ export function decompileLuauHeuristics(text, filePath = '') {
 }
 
 export function buildLuauDependencyMap(root, targetPath = '') {
-  const files = walkFiles(root, (filePath) => {
-    const ext = path.extname(filePath).toLowerCase();
-    if (!LUAU_EXTENSIONS.has(ext)) return false;
-    if (!targetPath) return true;
-    const rel = toPosix(relative(root, filePath));
-    const target = toPosix(targetPath);
-    return rel === target || rel.startsWith(`${target}/`);
-  });
+  const files = resolveLuauFiles(root, targetPath);
 
   const scripts = files.map((filePath) => {
     const text = readText(filePath);

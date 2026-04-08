@@ -31,6 +31,13 @@ test('helper-mcp exposes compatibility aliases and resources', async () => {
     assert.ok(toolNames.includes('brain_import'));
     assert.ok(toolNames.includes('brain_history'));
     assert.ok(toolNames.includes('brain_merge'));
+    assert.ok(toolNames.includes('brain_graph'));
+    assert.ok(toolNames.includes('brain_query_advanced'));
+    assert.ok(toolNames.includes('brain_diff'));
+    assert.ok(toolNames.includes('brain_link'));
+    assert.ok(toolNames.includes('brain_archive'));
+    assert.ok(toolNames.includes('brain_restore_diff'));
+    assert.ok(toolNames.includes('brain_prune_duplicates'));
     assert.ok(toolNames.includes('luau_hotfix'));
     assert.ok(toolNames.includes('luau_decompile'));
     assert.ok(toolNames.includes('luau_repair'));
@@ -39,9 +46,22 @@ test('helper-mcp exposes compatibility aliases and resources', async () => {
     assert.ok(toolNames.includes('luau_dependencies'));
     assert.ok(toolNames.includes('luau_remotes'));
     assert.ok(toolNames.includes('luau_complexity'));
+    assert.ok(toolNames.includes('luau_taint'));
+    assert.ok(toolNames.includes('luau_flow'));
+    assert.ok(toolNames.includes('luau_handlers'));
+    assert.ok(toolNames.includes('luau_surface'));
+    assert.ok(toolNames.includes('luau_refactor'));
+    assert.ok(toolNames.includes('luau_modulegraph'));
+    assert.ok(toolNames.includes('luau_risk_score'));
+    assert.ok(toolNames.includes('luau_diff_context'));
     assert.ok(toolNames.includes('luau_changelog'));
     assert.ok(toolNames.includes('luau_metrics'));
     assert.ok(toolNames.includes('luau_template'));
+    assert.ok(toolNames.includes('workspace_diff'));
+    assert.ok(toolNames.includes('workspace_rollback'));
+    assert.ok(toolNames.includes('workspace_validate'));
+    assert.ok(toolNames.includes('workspace_release_notes'));
+    assert.ok(toolNames.includes('workspace_restore_snapshot'));
     assert.ok(toolNames.includes('workspace_baseline'));
     assert.ok(toolNames.includes('config_validate'));
 
@@ -61,8 +81,8 @@ test('helper-mcp exposes compatibility aliases and resources', async () => {
     const text = result.content.map((block) => block.text || '').join('\n');
 
     assert.match(text, /"ok": true/);
-    assert.match(text, /"version": "0.6.0"/);
-    assert.match(text, /"canonicalToolCount": 40/);
+    assert.match(text, /"version": "0.6.1"/);
+    assert.match(text, /"canonicalToolCount": 60/);
   } finally {
     await client.close?.();
     await transport.close();
