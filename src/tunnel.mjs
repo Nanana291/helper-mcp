@@ -1,5 +1,6 @@
 #!/usr/bin/env node
 import { createServer } from 'node:http';
+import net from 'node:net';
 import process from 'node:process';
 import localtunnel from 'localtunnel';
 import { StreamableHTTPServerTransport } from '@modelcontextprotocol/sdk/server/streamableHttp.js';
@@ -7,11 +8,30 @@ import { randomUUID } from 'node:crypto';
 import { createMcpServer } from './http-server.mjs';
 import { resolveWorkspaceRoot } from './fs.mjs';
 
-const port = Number(process.env.HELPER_MCP_PORT || 3333);
+const startPort = Number(process.env.HELPER_MCP_PORT || 3333);
 const host = process.env.HELPER_MCP_HOST || '0.0.0.0';
 const workspaceRoot = resolveWorkspaceRoot();
 
 const sessions = new Map();
+
+async function findFreePort(startPort) {
+  for (let candidate = startPort; candidate < startPort + 20; candidate += 1) {
+    const available = await new Promise((resolve) => {
+      const probe = net.createServer();
+      probe.unref();
+      probe.once('error', () => resolve(false));
+      probe.listen(candidate, host, () => {
+        probe.close(() => resolve(true));
+      });
+    });
+    if (available) {
+      return candidate;
+    }
+  }
+  throw new Error(`No free port found starting at ${startPort}`);
+}
+
+const actualPort = await findFreePort(startPort);
 
 const httpServer = createServer(async (req, res) => {
   if (!req.url || !req.url.startsWith('/mcp')) {
@@ -72,10 +92,10 @@ const httpServer = createServer(async (req, res) => {
   }
 });
 
-httpServer.listen(port, host, async () => {
-  process.stdout.write(`helper-mcp HTTP listening on http://${host}:${port}/mcp\n`);
+httpServer.listen(actualPort, host, async () => {
+  process.stdout.write(`helper-mcp HTTP listening on http://${host}:${actualPort}/mcp\n`);
   try {
-    const tunnel = await localtunnel({ port });
+    const tunnel = await localtunnel({ port: actualPort });
     process.stdout.write(`helper-mcp tunnel URL: ${tunnel.url}\n`);
     process.stdout.write(`Codex add command: codex mcp add helper-mcp --url ${tunnel.url}/mcp\n`);
 

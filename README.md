@@ -102,3 +102,4 @@ qwen mcp list
 - If a client has trouble with dotted tool names, use the underscore alias with the same behavior.
 - For Codex, keep the HTTP server running while the session uses the MCP tools.
 - The Codex setup works best through the HTTPS tunnel printed by `npm run start:tunnel`.
+- If `3333` is already taken, `start:tunnel` automatically picks the next free port.
