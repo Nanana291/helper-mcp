@@ -45,6 +45,17 @@ function workspaceSummary(workspaceRoot) {
   };
 }
 
+function toolAnnotations(canonicalName) {
+  const readOnly = canonicalName === 'healthcheck' || canonicalName === 'workspace.summary' || canonicalName === 'brain.search' || canonicalName === 'brain.snapshot' || canonicalName === 'luau.scan' || canonicalName === 'luau.inspect' || canonicalName === 'luau.compare';
+  return {
+    title: canonicalName.replace(/\./g, ' '),
+    readOnlyHint: readOnly,
+    destructiveHint: !readOnly,
+    idempotentHint: readOnly,
+    openWorldHint: false,
+  };
+}
+
 const toolDefinitions = [
   {
     canonicalName: 'healthcheck',
@@ -174,8 +185,10 @@ export function getTools() {
     const displayName = definition.aliases.find((alias) => !alias.includes('.')) || definition.canonicalName;
     tools.push({
       name: displayName,
+      title: definition.canonicalName.replace(/\./g, ' '),
       description: definition.description,
       inputSchema: definition.inputSchema,
+      annotations: toolAnnotations(definition.canonicalName),
     });
   }
   return tools;
