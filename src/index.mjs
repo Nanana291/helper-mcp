@@ -2,10 +2,10 @@
 import process from 'node:process';
 import { Server } from '@modelcontextprotocol/sdk/server/index.js';
 import { StdioServerTransport } from '@modelcontextprotocol/sdk/server/stdio.js';
-import { CallToolRequestSchema, ListResourcesRequestSchema, ListToolsRequestSchema, ReadResourceRequestSchema } from '@modelcontextprotocol/sdk/types.js';
-import { appendBrainNote, brainResourceText, listBrainNotes, loadBrainSnapshot, searchBrainNotes } from './brain.mjs';
+import { CallToolRequestSchema, ListToolsRequestSchema } from '@modelcontextprotocol/sdk/types.js';
+import { appendBrainNote, loadBrainSnapshot, searchBrainNotes } from './brain.mjs';
 import { analyzeLuauText, compareLuauFiles, formatLuauAnalysis, scanLuauWorkspace } from './luau.mjs';
-import { readText, resolveWorkspaceRoot, relative } from './fs.mjs';
+import { readText, resolveWorkspaceRoot } from './fs.mjs';
 
 const name = 'helper-mcp';
 const version = '0.1.0';
@@ -16,7 +16,6 @@ const server = new Server(
   {
     capabilities: {
       tools: {},
-      resources: {},
     },
   },
 );
@@ -236,35 +235,5 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
   return handleTool(toolName, args);
 });
 
-server.setRequestHandler(ListResourcesRequestSchema, async () => ({
-  resources: [
-    {
-      uri: 'helper://workspace',
-      name: 'Workspace Summary',
-      description: 'A small summary of the current workspace and Luau coverage.',
-      mimeType: 'application/json',
-    },
-    {
-      uri: 'helper://brain',
-      name: 'Helper Brain',
-      description: 'The current local second brain snapshot.',
-      mimeType: 'text/plain',
-    },
-  ],
-}));
-
-server.setRequestHandler(ReadResourceRequestSchema, async (request) => {
-  const { uri } = request.params;
-  switch (uri) {
-    case 'helper://workspace':
-      return resourceResult(uri, jsonText(workspaceSummary()), 'application/json');
-    case 'helper://brain':
-      return resourceResult(uri, brainResourceText(workspaceRoot), 'text/plain');
-    default:
-      throw new Error(`Unknown resource: ${uri}`);
-  }
-});
-
 const transport = new StdioServerTransport();
 await server.connect(transport);
-

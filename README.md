@@ -20,6 +20,8 @@ It is designed to help with tasks like:
 - `luau.compare`
 - `luau.note`
 
+The default server surface is tool-only for maximum Codex compatibility.
+
 ## Install
 
 Clone the repo:
@@ -79,4 +81,3 @@ qwen mcp list
 - Use a trusted workspace. `helper-mcp` reads local files from the current project root.
 - Set `HELPER_MCP_ROOT` if you need the server to point at a different workspace root.
 - The write tools only affect the local `.helper-mcp/` brain store.
-
