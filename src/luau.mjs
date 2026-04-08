@@ -81,6 +81,17 @@ function getMissingPcallMatches(lines) {
   return matches;
 }
 
+function countIdentifiers(text, identifier) {
+  if (!identifier) return 0;
+  const escaped = String(identifier).replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+  const matches = String(text || '').match(new RegExp(`\\b${escaped}\\b`, 'g'));
+  return matches ? matches.length : 0;
+}
+
+function textHash(text) {
+  return crypto.createHash('sha256').update(String(text || ''), 'utf8').digest('hex');
+}
+
 export function analyzeLuauText(text, filePath = '') {
   const source = String(text || '');
   const lines = source.split(/\r?\n/);
@@ -605,4 +616,306 @@ export function migrationChecklist(root, oldPath, newPath) {
     warnings: warnings.length,
     checklist,
   };
+}
+
+export function scanLuauSecurity(text, filePath = '') {
+  const source = String(text || '');
+  const lines = source.split(/\r?\n/);
+  const patterns = [
+    { label: 'webhook', re: /https?:\/\/(?:canary\.|ptb\.)?(?:discord(?:app)?\.com|discord\.com)\/api\/webhooks\/\d+\/[A-Za-z0-9_-]+/i },
+    { label: 'loadstring-remote', re: /\bloadstring\s*\(\s*(?:game\.)?(?:HttpGet|HttpGetAsync|RequestAsync)\s*\(/i },
+    { label: 'token-exfil', re: /\b(api[_-]?key|token|secret|cookie|session)\b/i },
+    { label: 'http-call', re: /\bHttp(Service|Get|Post|RequestAsync)\b/i },
+    { label: 'backdoor-pattern', re: /\b(getfenv|getgenv|setclipboard|syn\.request|http_request)\b/i },
+  ];
+  const findings = [];
+  for (const pattern of patterns) {
+    for (let i = 0; i < lines.length; i += 1) {
+      if (pattern.re.test(lines[i])) {
+        findings.push({ line: i + 1, label: pattern.label, text: lines[i].trim() });
+      }
+    }
+  }
+  return {
+    summary: {
+      filePath: toPosix(filePath),
+      findingCount: findings.length,
+      highRiskCount: findings.filter((finding) => /webhook|loadstring-remote|backdoor-pattern|token-exfil/i.test(finding.label)).length,
+    },
+    findings,
+  };
+}
+
+export function profileLuauPerformance(text, filePath = '') {
+  const source = String(text || '');
+  const lines = source.split(/\r?\n/);
+  const findings = [];
+  const patterns = [
+    { label: 'hot-loop', re: /\bwhile\s+true\s+do\b/ },
+    { label: 'repeat-loop', re: /\brepeat\b[\s\S]{0,80}\buntil\b/i },
+    { label: 'nested-wait', re: /\bwait\s*\(\s*\)\s*[\s\S]{0,40}\bwait\s*\(\s*\)/i },
+    { label: 'task-spawn', re: /\btask\.spawn\s*\(/i },
+    { label: 'spawn', re: /\bspawn\s*\(/i },
+    { label: 'delay', re: /\bdelay\s*\(/i },
+    { label: 'connect-without-cleanup', re: /\bConnect\s*\(/i },
+  ];
+  for (const pattern of patterns) {
+    for (let i = 0; i < lines.length; i += 1) {
+      if (pattern.re.test(lines[i])) {
+        findings.push({ line: i + 1, label: pattern.label, text: lines[i].trim() });
+      }
+    }
+  }
+  return {
+    summary: {
+      filePath: toPosix(filePath),
+      findingCount: findings.length,
+      loopCount: findings.filter((finding) => /hot-loop|repeat-loop|nested-wait/.test(finding.label)).length,
+      cleanupIssues: findings.filter((finding) => finding.label === 'connect-without-cleanup').length,
+    },
+    findings,
+  };
+}
+
+export function decompileLuauHeuristics(text, filePath = '') {
+  const source = String(text || '');
+  const lines = source.split(/\r?\n/);
+  const patterns = [
+    { label: 'char-encoding', re: /\bstring\.char\s*\(/i },
+    { label: 'byte-encoding', re: /\bstring\.byte\s*\(/i },
+    { label: 'xor-math', re: /\bbit32\.bxor\s*\(/i },
+    { label: 'gsub-obfuscation', re: /\bstring\.gsub\s*\(\s*[^,]+,\s*["'][^"']{0,4}["']/i },
+    { label: 'hex-string', re: /0x[0-9a-f]{8,}/i },
+    { label: 'long-concat', re: /\.\.\s*["'][^"']{0,2}["']\s*\.\./ },
+    { label: 'loader', re: /\b(loadstring|load|require)\s*\(/i },
+  ];
+  const findings = [];
+  for (const pattern of patterns) {
+    for (let i = 0; i < lines.length; i += 1) {
+      if (pattern.re.test(lines[i])) {
+        findings.push({ line: i + 1, label: pattern.label, text: lines[i].trim() });
+      }
+    }
+  }
+  const strings = (source.match(/["'][^"']{3,}["']/g) || []).slice(0, 100);
+  return {
+    summary: {
+      filePath: toPosix(filePath),
+      findingCount: findings.length,
+      sourceHash: crypto.createHash('sha256').update(source, 'utf8').digest('hex'),
+    },
+    findings,
+    strings,
+    remoteHints: lines
+      .map((line, index) => ({ line: index + 1, text: line.trim() }))
+      .filter((entry) => /\b(RemoteEvent|RemoteFunction|FireServer|InvokeServer|FireClient)\b/i.test(entry.text)),
+  };
+}
+
+export function buildLuauDependencyMap(root, targetPath = '') {
+  const files = walkFiles(root, (filePath) => {
+    const ext = path.extname(filePath).toLowerCase();
+    if (!LUAU_EXTENSIONS.has(ext)) return false;
+    if (!targetPath) return true;
+    const rel = toPosix(relative(root, filePath));
+    const target = toPosix(targetPath);
+    return rel === target || rel.startsWith(`${target}/`);
+  });
+
+  const scripts = files.map((filePath) => {
+    const text = readText(filePath);
+    const requires = [];
+    const lines = text.split(/\r?\n/);
+    for (let i = 0; i < lines.length; i += 1) {
+      const match = /local\s+([A-Za-z_][A-Za-z0-9_]*)\s*=\s*require\s*\(\s*([^)]+)\s*\)/.exec(lines[i]) || /([A-Za-z_][A-Za-z0-9_]*)\s*=\s*require\s*\(\s*([^)]+)\s*\)/.exec(lines[i]);
+      if (match) {
+        requires.push({ line: i + 1, alias: match[1], target: match[2].trim(), text: lines[i].trim() });
+      }
+    }
+    const unusedImports = requires.filter((entry) => (text.match(new RegExp(`\\b${entry.alias}\\b`, 'g')) || []).length <= 1).map((entry) => entry.alias);
+    return {
+      path: toPosix(relative(root, filePath)),
+      requires,
+      unusedImports,
+      hash: crypto.createHash('sha256').update(text, 'utf8').digest('hex'),
+    };
+  });
+
+  return {
+    summary: {
+      scriptCount: scripts.length,
+      dependencyCount: scripts.reduce((sum, script) => sum + script.requires.length, 0),
+      orphanedScriptCount: scripts.filter((script) => script.requires.length === 0).length,
+    },
+    scripts,
+  };
+}
+
+export function generateLuauTemplate({ templateType = 'utility', name = 'NewScript', outputPath = '' } = {}) {
+  const safeName = String(name || 'NewScript').replace(/[^A-Za-z0-9_]/g, '') || 'NewScript';
+  const templates = {
+    'auto-farm': [
+      'local Players = game:GetService("Players")',
+      'local RunService = game:GetService("RunService")',
+      '',
+      'local Connections = {}',
+      '',
+      'local function Track(connection)',
+      '    Connections[#Connections + 1] = connection',
+      '    return connection',
+      'end',
+      '',
+      'RunService.Heartbeat:Connect(function()',
+      '    pcall(function()',
+      '        -- auto-farm logic',
+      '    end)',
+      'end)',
+      '',
+    ],
+    esp: [
+      'local RunService = game:GetService("RunService")',
+      '',
+      'RunService.RenderStepped:Connect(function()',
+      '    pcall(function()',
+      '        -- ESP render logic',
+      '    end)',
+      'end)',
+      '',
+    ],
+    combat: [
+      'local ReplicatedStorage = game:GetService("ReplicatedStorage")',
+      'local Remote = ReplicatedStorage:WaitForChild("RemoteEvent")',
+      '',
+      'local function FireSafely(...)',
+      '    return pcall(function(...)',
+      '        Remote:FireServer(...)',
+      '    end, ...)',
+      'end',
+      '',
+    ],
+    utility: [
+      'local function Main()',
+      '    pcall(function()',
+      '        -- utility logic',
+      '    end)',
+      'end',
+      '',
+      'Main()',
+      '',
+    ],
+  };
+  const scaffold = [`-- helper-mcp template: ${templateType}`, `-- script: ${safeName}`, '', ...(templates[templateType] || templates.utility)].join('\n');
+  if (outputPath) {
+    writeText(outputPath, `${scaffold.trimEnd()}\n`);
+  }
+  return { templateType, name: safeName, outputPath: toPosix(outputPath), scaffold: `${scaffold.trimEnd()}\n` };
+}
+
+function wrapRemoteStatements(lines) {
+  const output = [];
+  const edits = [];
+  for (let index = 0; index < lines.length; index += 1) {
+    const line = lines[index];
+    const trimmed = line.trim();
+    if (/:((FireServer)|(InvokeServer))\s*\(/.test(trimmed) && !/\bpcall\s*\(/.test(trimmed) && !trimmed.startsWith('--')) {
+      output.push(`${line.match(/^\s*/)?.[0] || ''}pcall(function() ${trimmed} end)`);
+      edits.push({ line: index + 1, before: line, after: `pcall(function() ${trimmed} end)`, label: 'pcall-wrap' });
+      continue;
+    }
+    output.push(line);
+  }
+  return { lines: output, edits };
+}
+
+function insertRateLimitGuards(lines) {
+  const output = [];
+  const edits = [];
+  let previousRemote = '';
+  for (let index = 0; index < lines.length; index += 1) {
+    const line = lines[index];
+    const trimmed = line.trim();
+    const currentRemote = trimmed.match(/([A-Za-z_][A-Za-z0-9_\.:\[\]]*):(FireServer|InvokeServer)\s*\(/)?.[1] || '';
+    if (currentRemote && currentRemote === previousRemote) {
+      const indent = line.match(/^\s*/)?.[0] || '';
+      const guard = `${indent}task.wait(0.15) -- helper-mcp inserted rate limiter`;
+      output.push(guard);
+      edits.push({ line: index + 1, before: '', after: guard, label: 'remote-rate-limit' });
+    }
+    output.push(line);
+    previousRemote = currentRemote || previousRemote;
+  }
+  return { lines: output, edits };
+}
+
+function prependConnectionCleanup(lines, originalText) {
+  const hasConnect = /\bConnect\s*\(/.test(originalText);
+  const hasDisconnect = /\bDisconnect\s*\(/.test(originalText) || /\bDestroy\s*\(/.test(originalText);
+  if (!hasConnect || hasDisconnect) {
+    return { lines, edits: [] };
+  }
+  const helperBlock = [
+    '-- helper-mcp inserted connection cleanup helper',
+    'local __helperConnections = {}',
+    'local function __helperTrack(connection)',
+    '    __helperConnections[#__helperConnections + 1] = connection',
+    '    return connection',
+    'end',
+    '',
+  ];
+  return {
+    lines: [...helperBlock, ...lines],
+    edits: [{ line: 1, before: '', after: helperBlock.join('\n').trimEnd(), label: 'connection-cleanup-helper' }],
+  };
+}
+
+export function hotfixLuauText(text, filePath = '', { apply = true } = {}) {
+  const source = String(text || '');
+  const originalLines = source.split(/\r?\n/);
+  const pcallFix = wrapRemoteStatements(originalLines);
+  const rateLimitFix = insertRateLimitGuards(pcallFix.lines);
+  const cleanupFix = prependConnectionCleanup(rateLimitFix.lines, source);
+  const finalText = cleanupFix.lines.join('\n');
+  return {
+    summary: {
+      filePath: toPosix(filePath),
+      appliedFixCount: pcallFix.edits.length + rateLimitFix.edits.length + cleanupFix.edits.length,
+      beforeHash: crypto.createHash('sha256').update(source, 'utf8').digest('hex'),
+      afterHash: crypto.createHash('sha256').update(finalText, 'utf8').digest('hex'),
+      changed: finalText !== source,
+    },
+    fixes: [...pcallFix.edits, ...rateLimitFix.edits, ...cleanupFix.edits],
+    before: source,
+    after: finalText,
+    applied: apply !== false,
+  };
+}
+
+export function formatLuauHotfix(report) {
+  const lines = [];
+  lines.push(`# ${report.summary.filePath || 'Luau hotfix'}`);
+  lines.push('');
+  lines.push(`Applied fixes: ${report.summary.appliedFixCount}`);
+  lines.push(`Changed: ${report.summary.changed ? 'yes' : 'no'}`);
+  lines.push(`Before hash: ${report.summary.beforeHash}`);
+  lines.push(`After hash: ${report.summary.afterHash}`);
+  lines.push('');
+  for (const fix of report.fixes) {
+    lines.push(`- ${fix.label} @ L${fix.line}`);
+  }
+  lines.push('');
+  return `${lines.join('\n').trimEnd()}\n`;
+}
+
+export function writeLuauHotfixSnapshots(root, filePath, report) {
+  const dir = path.join(root, '.helper-mcp', 'hotfixes');
+  fs.mkdirSync(dir, { recursive: true });
+  const safeName = String(filePath || 'hotfix').replace(/[^\w.-]+/g, '_') || 'hotfix';
+  const snapshotPath = path.join(dir, `${safeName}.json`);
+  writeText(snapshotPath, `${JSON.stringify({
+    kind: 'helper-mcp-hotfix',
+    generatedAt: new Date().toISOString(),
+    filePath: toPosix(filePath),
+    report,
+  }, null, 2)}\n`);
+  return snapshotPath;
 }

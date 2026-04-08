@@ -309,37 +309,6 @@ function inferTagsFromText(text) {
   return tags;
 }
 
-function parseImportSource(filePath) {
-  const text = readText(filePath);
-  const ext = path.extname(filePath).toLowerCase();
-  if (ext === '.json') {
-    const parsed = (() => {
-      try {
-        return JSON.parse(text);
-      } catch {
-        return null;
-      }
-    })();
-    if (parsed && typeof parsed === 'object') {
-      const title = String(parsed.title || parsed.name || parsed.id || path.basename(filePath)).trim();
-      const summary = String(parsed.summary || parsed.description || parsed.note || '').trim() || `Imported from ${path.basename(filePath)}`;
-      return { title, summary, tags: inferTagsFromText(`${title} ${summary} ${JSON.stringify(parsed)}`), evidence: text.trim(), sourcePath: toPosix(filePath) };
-    }
-  }
-
-  const lines = text.split(/\r?\n/).map((line) => line.trim()).filter(Boolean);
-  const titleLine = lines.find((line) => /^#{1,3}\s+/.test(line)) || lines[0] || path.basename(filePath);
-  const title = titleLine.replace(/^#{1,3}\s+/, '').trim();
-  const summary = lines.slice(1, 6).join(' ').slice(0, 240) || `Imported from ${path.basename(filePath)}`;
-  return {
-    title,
-    summary,
-    tags: inferTagsFromText(`${title} ${summary} ${text}`),
-    evidence: lines.slice(0, 12).join('\n'),
-    sourcePath: toPosix(filePath),
-  };
-}
-
 export function brainResourceText(root) {
   const snapshot = buildBrainSnapshot(root);
   const lines = [
@@ -360,6 +329,99 @@ export function brainResourceText(root) {
   }
 
   return lines.join('\n');
+}
+
+function inferImportedTags(text) {
+  const source = normalizeText(text);
+  const tags = [];
+  const tagMap = [
+    ['luau', /\bluau\b/],
+    ['config', /\bconfig\b/],
+    ['baseline', /\bbaseline\b/],
+    ['regression', /\bregression\b/],
+    ['security', /\bsecurity\b|\bwebhook\b|\btoken\b|\bbackdoor\b/],
+    ['performance', /\bperformance\b|\bhot\s*loop\b|\bmemory leak\b/],
+    ['dependency', /\bdependency\b|\brequire\b/],
+    ['template', /\btemplate\b|\bscaffold\b/],
+    ['analysis', /\banalysis\b|\bscan\b|\binspect\b/],
+  ];
+  for (const [tag, pattern] of tagMap) {
+    if (pattern.test(source)) {
+      tags.push(tag);
+    }
+  }
+  return tags;
+}
+
+function parseImportSource(filePath) {
+  const text = readText(filePath);
+  const ext = path.extname(filePath).toLowerCase();
+  if (ext === '.json') {
+    try {
+      const parsed = JSON.parse(text);
+      if (parsed && typeof parsed === 'object') {
+        const title = String(parsed.title || parsed.name || parsed.id || path.basename(filePath)).trim();
+        const summary = String(parsed.summary || parsed.description || parsed.note || '').trim() || `Imported from ${path.basename(filePath)}`;
+        return { title, summary, tags: inferImportedTags(`${title} ${summary} ${JSON.stringify(parsed)}`), evidence: text.trim(), sourcePath: toPosix(filePath) };
+      }
+    } catch {
+      // fall through to text parsing
+    }
+  }
+
+  const lines = text.split(/\r?\n/).map((line) => line.trim()).filter(Boolean);
+  const titleLine = lines.find((line) => /^#{1,3}\s+/.test(line)) || lines[0] || path.basename(filePath);
+  const title = titleLine.replace(/^#{1,3}\s+/, '').trim();
+  const summary = lines.slice(1, 6).join(' ').slice(0, 240) || `Imported from ${path.basename(filePath)}`;
+  return {
+    title,
+    summary,
+    tags: inferImportedTags(`${title} ${summary} ${text}`),
+    evidence: lines.slice(0, 12).join('\n'),
+    sourcePath: toPosix(filePath),
+  };
+}
+
+export function importBrainNotes(root, sources = []) {
+  const normalizedSources = (Array.isArray(sources) ? sources : [sources]).flat().filter(Boolean);
+  const files = [];
+  for (const source of normalizedSources) {
+    const resolved = path.isAbsolute(source) ? source : path.resolve(root, source);
+    if (!fs.existsSync(resolved)) {
+      continue;
+    }
+    const stat = fs.statSync(resolved);
+    if (stat.isFile()) {
+      files.push(resolved);
+    } else if (stat.isDirectory()) {
+      files.push(...walkFiles(resolved, (filePath) => ['.md', '.json', '.txt'].includes(path.extname(filePath).toLowerCase())));
+    }
+  }
+
+  const imported = [];
+  for (const file of files) {
+    const note = parseImportSource(file);
+    const snapshot = appendBrainNote(root, {
+      title: note.title,
+      summary: note.summary,
+      scope: 'workspace',
+      status: 'candidate',
+      tags: note.tags,
+      sourcePath: note.sourcePath,
+      evidence: note.evidence,
+    });
+    imported.push({
+      filePath: toPosix(path.relative(root, file) || file),
+      title: note.title,
+      tags: note.tags,
+      counts: snapshot.counts,
+    });
+  }
+
+  return {
+    importedCount: imported.length,
+    imported,
+  };
 }
 
 export function deleteBrainNote(root, id) {

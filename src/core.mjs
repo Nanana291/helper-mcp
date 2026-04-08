@@ -4,6 +4,7 @@ import {
   buildBrainSnapshot,
   deleteBrainNote,
   exportBrainToMarkdown,
+  importBrainNotes,
   listBrainNotes,
   loadBrainSnapshot,
   promoteBrainNote,
@@ -14,19 +15,29 @@ import {
 } from './brain.mjs';
 import {
   analyzeLuauText,
+  buildLuauDependencyMap,
   compareLuauFiles,
   diffLuauFiles,
+  decompileLuauHeuristics,
   extractFlagsFromText,
   extractUIMap,
   formatLuauAnalysis,
+  formatLuauHotfix,
+  generateLuauTemplate,
+  hotfixLuauText,
   migrationChecklist,
   patternSearchLuau,
+  profileLuauPerformance,
+  scanLuauSecurity,
   scanLuauWorkspace,
+  writeLuauHotfixSnapshots,
 } from './luau.mjs';
-import { readText } from './fs.mjs';
+import { buildConfigValidationMarkdown, saveConfigValidation, validateConfigFile } from './config.mjs';
+import { captureWorkspaceBaseline, generateWorkspaceChangelog } from './workspace.mjs';
+import { readText, writeText } from './fs.mjs';
 
 export const serverName = 'helper-mcp';
-export const serverVersion = '0.4.1';
+export const serverVersion = '0.5.0';
 
 function jsonText(value) {
   return JSON.stringify(value, null, 2);
@@ -152,18 +163,23 @@ function toolAnnotations(canonicalName) {
     'brain.search', 'brain.snapshot', 'brain.list', 'brain.export',
     'luau.scan', 'luau.inspect', 'luau.compare', 'luau.diff', 'luau.pattern',
     'luau.flags', 'luau.ui_map', 'luau.migration',
+    'luau.decompile', 'luau.security_scan', 'luau.performance_profile', 'luau.dependency_map',
   ]);
   const readOnly = readOnlyTools.has(canonicalName);
   return {
     title: canonicalName.replace(/\./g, ' '),
-    readOnlyHint: readOnlyNames.has(canonicalName),
-    destructiveHint: !readOnlyNames.has(canonicalName),
-    idempotentHint: readOnlyNames.has(canonicalName),
+    readOnlyHint: readOnly,
+    destructiveHint: !readOnly,
+    idempotentHint: readOnly,
     openWorldHint: false,
   };
 }
 
 // ── Tool definitions ──────────────────────────────────────────────────────────
+
+function toolDefinition(canonicalName, aliases, description, inputSchema) {
+  return { canonicalName, aliases, description, inputSchema };
+}
 
 const toolDefinitions = [
   // Meta
@@ -419,9 +435,7 @@ const toolDefinitions = [
       required: ['oldPath', 'newPath'],
       additionalProperties: false,
     },
-    required: ['filePath'],
-    additionalProperties: false,
-  }),
+  },
   toolDefinition('luau.security_scan', ['luau.security_scan', 'luau_security_scan'], 'Audit Luau scripts for webhook leaks, token exfiltration, and backdoor patterns.', {
     type: 'object',
     properties: {
@@ -479,6 +493,31 @@ const toolDefinitions = [
       filePath: { type: 'string' },
       schemaPath: { type: 'string' },
       record: { type: 'boolean' },
+    },
+    required: ['filePath'],
+    additionalProperties: false,
+  }),
+  toolDefinition('brain.import', ['brain.import', 'brain_import'], 'Import notes from markdown, JSON, or text sources into the local helper brain.', {
+    type: 'object',
+    properties: {
+      sources: { type: 'array', items: { type: 'string' } },
+    },
+    required: ['sources'],
+    additionalProperties: false,
+  }),
+  toolDefinition('luau.hotfix', ['luau.hotfix', 'luau_hotfix'], 'Apply conservative Luau repair heuristics and store before/after snapshots.', {
+    type: 'object',
+    properties: {
+      filePath: { type: 'string' },
+      apply: { type: 'boolean' },
+    },
+    required: ['filePath'],
+    additionalProperties: false,
+  }),
+  toolDefinition('luau.decompile', ['luau.decompile', 'luau_decompile'], 'Heuristically analyze Luau bytecode-like or obfuscated source patterns.', {
+    type: 'object',
+    properties: {
+      filePath: { type: 'string' },
     },
     required: ['filePath'],
     additionalProperties: false,
@@ -587,6 +626,15 @@ export function handleTool(workspaceRoot, requestedName, args = {}) {
 
     case 'brain.snapshot': return textResult(jsonText(loadBrainSnapshot(workspaceRoot)));
 
+    case 'brain.import': {
+      const imported = importBrainNotes(workspaceRoot, args.sources || []);
+      return textResult(jsonText({
+        ok: true,
+        message: 'Brain notes imported.',
+        ...imported,
+      }));
+    }
+
     case 'brain.promote': return textResult(jsonText(promoteBrainNote(workspaceRoot, args.id, args.status)));
 
     case 'brain.tag': return textResult(jsonText(tagBrainNote(workspaceRoot, args.id, args.tags || [])));
@@ -641,6 +689,54 @@ export function handleTool(workspaceRoot, requestedName, args = {}) {
         tags: args.tags || ['luau'], sourcePath: args.sourcePath || '', evidence: args.evidence || '',
       });
       return textResult(jsonText({ ok: true, message: 'Luau lesson stored.', counts: snapshot.counts }));
+    }
+
+    case 'luau.hotfix': {
+      const resolved = resolveFilePath(workspaceRoot, args.filePath);
+      const before = readText(resolved);
+      const report = hotfixLuauText(before, resolved, { apply: args.apply !== false });
+      if (args.apply !== false && report.summary.changed) {
+        writeText(resolved, `${report.after.trimEnd()}\n`);
+      }
+      const snapshotPath = writeLuauHotfixSnapshots(workspaceRoot, resolved, report);
+      return textResult(jsonText({
+        ok: true,
+        snapshotPath,
+        report,
+        markdown: formatLuauHotfix(report),
+      }));
+    }
+
+    case 'luau.decompile': {
+      const resolved = resolveFilePath(workspaceRoot, args.filePath);
+      const report = decompileLuauHeuristics(readText(resolved), resolved);
+      return textResult(jsonText(report));
+    }
+
+    case 'luau.security_scan': {
+      const resolved = resolveFilePath(workspaceRoot, args.filePath);
+      const report = scanLuauSecurity(readText(resolved), resolved);
+      return textResult(jsonText(report));
+    }
+
+    case 'luau.performance_profile': {
+      const resolved = resolveFilePath(workspaceRoot, args.filePath);
+      const report = profileLuauPerformance(readText(resolved), resolved);
+      return textResult(jsonText(report));
+    }
+
+    case 'luau.dependency_map': {
+      const report = buildLuauDependencyMap(workspaceRoot, args.targetPath || '');
+      return textResult(jsonText(report));
+    }
+
+    case 'luau.template': {
+      const report = generateLuauTemplate({
+        templateType: args.templateType || 'utility',
+        name: args.name || 'NewScript',
+        outputPath: args.outputPath || '',
+      });
+      return textResult(jsonText(report));
     }
 
     default: throw new Error(`Unknown tool: ${requestedName}`);
