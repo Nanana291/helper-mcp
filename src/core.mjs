@@ -26,7 +26,7 @@ import {
 import { readText } from './fs.mjs';
 
 export const serverName = 'helper-mcp';
-export const serverVersion = '0.4.0';
+export const serverVersion = '0.4.1';
 
 function jsonText(value) {
   return JSON.stringify(value, null, 2);
@@ -448,7 +448,6 @@ export function getTools() {
     const displayName = definition.aliases.find((a) => !a.includes('.')) || definition.canonicalName;
     return {
       name: displayName,
-      title: definition.canonicalName.replace(/\./g, ' '),
       description: definition.description,
       inputSchema: definition.inputSchema,
       annotations: toolAnnotations(definition.canonicalName),
