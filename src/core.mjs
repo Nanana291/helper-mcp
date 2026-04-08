@@ -2,18 +2,20 @@ import path from 'node:path';
 import {
   appendBrainNote,
   buildBrainSnapshot,
+  deleteBrainNote,
   exportBrainToMarkdown,
   listBrainNotes,
   loadBrainSnapshot,
   promoteBrainNote,
   searchBrainNotes,
   tagBrainNote,
+  updateBrainNote,
 } from './brain.mjs';
-import { analyzeLuauText, compareLuauFiles, diffLuauFiles, formatLuauAnalysis, scanLuauWorkspace } from './luau.mjs';
+import { analyzeLuauText, compareLuauFiles, diffLuauFiles, formatLuauAnalysis, patternSearchLuau, scanLuauWorkspace } from './luau.mjs';
 import { readText } from './fs.mjs';
 
 export const serverName = 'helper-mcp';
-export const serverVersion = '0.2.0';
+export const serverVersion = '0.3.0';
 
 function jsonText(value) {
   return JSON.stringify(value, null, 2);
@@ -21,24 +23,13 @@ function jsonText(value) {
 
 function textResult(text) {
   return {
-    content: [
-      {
-        type: 'text',
-        text,
-      },
-    ],
+    content: [{ type: 'text', text }],
   };
 }
 
 function resourceResult(uri, text, mimeType = 'text/plain') {
   return {
-    contents: [
-      {
-        uri,
-        mimeType,
-        text,
-      },
-    ],
+    contents: [{ uri, mimeType, text }],
   };
 }
 
@@ -103,11 +94,99 @@ function workspaceCoverage(workspaceRoot) {
   };
 }
 
+function workspaceAudit(workspaceRoot) {
+  const scan = scanLuauWorkspace(workspaceRoot);
+  const actions = [];
+
+  let totalRemotes = 0;
+  let remotesWithPcall = 0;
+  let totalLocals = 0;
+
+  for (const f of scan.files) {
+    const remoteCount = f.summary.remoteCount;
+    const localCount = f.summary.localCount;
+    totalRemotes += remoteCount;
+    totalLocals += localCount;
+
+    // Count remotes that have pcall on the same line
+    const missingPcall = f.categories.risks.filter((r) => r.label === 'missing-pcall').length;
+    remotesWithPcall += Math.max(0, remoteCount - missingPcall);
+
+    // Local pressure
+    if (localCount > 180) {
+      actions.push({
+        priority: 1,
+        file: f.filePath,
+        issue: 'local-pressure-critical',
+        details: `${localCount} local declarations — near the 200-register Luau limit. Wrap page blocks in do...end or group into tables.`,
+      });
+    } else if (localCount > 150) {
+      actions.push({
+        priority: 2,
+        file: f.filePath,
+        issue: 'local-pressure-warning',
+        details: `${localCount} local declarations — approaching the 200-register Luau limit.`,
+      });
+    }
+
+    // Missing pcall
+    if (missingPcall > 0) {
+      const lines = f.categories.risks.filter((r) => r.label === 'missing-pcall').map((r) => r.line).join(', ');
+      actions.push({
+        priority: missingPcall >= 3 ? 1 : 2,
+        file: f.filePath,
+        issue: 'missing-pcall',
+        details: `${missingPcall} remote call(s) without pcall at lines: ${lines}.`,
+      });
+    }
+
+    // Legacy API risks
+    const legacyRisks = f.categories.risks.filter((r) => ['wait', 'spawn', 'delay'].includes(r.label));
+    if (legacyRisks.length > 0) {
+      actions.push({
+        priority: 3,
+        file: f.filePath,
+        issue: 'legacy-api',
+        details: `${legacyRisks.length} use(s) of deprecated wait/spawn/delay — replace with task.wait/task.spawn/task.delay.`,
+      });
+    }
+
+    // Unbounded loops
+    const unbounded = f.categories.risks.filter((r) => r.label === 'unbounded-loop');
+    if (unbounded.length > 0) {
+      actions.push({
+        priority: 2,
+        file: f.filePath,
+        issue: 'unbounded-loop',
+        details: `${unbounded.length} while true do loop(s) — verify each has a proper exit condition.`,
+      });
+    }
+  }
+
+  // Sort by priority then file name
+  actions.sort((a, b) => a.priority - b.priority || a.file.localeCompare(b.file));
+
+  const pcallCoverage = totalRemotes > 0 ? Math.round((remotesWithPcall / totalRemotes) * 100) : 100;
+  const avgLocalPressure = scan.totalFiles > 0 ? Math.round((totalLocals / scan.totalFiles / 200) * 100) : 0;
+
+  return {
+    summary: {
+      totalFiles: scan.totalFiles,
+      filesWithRisks: scan.files.filter((f) => f.summary.riskCount > 0).length,
+      totalRisks: scan.totalRisks,
+      pcallCoverage: `${pcallCoverage}%`,
+      avgLocalPressure: `${avgLocalPressure}%`,
+    },
+    actionCount: actions.length,
+    actions,
+  };
+}
+
 function toolAnnotations(canonicalName) {
   const readOnlyTools = new Set([
-    'healthcheck', 'workspace.summary', 'workspace.risks', 'workspace.coverage',
+    'healthcheck', 'workspace.summary', 'workspace.risks', 'workspace.coverage', 'workspace.audit',
     'brain.search', 'brain.snapshot', 'brain.list', 'brain.export',
-    'luau.scan', 'luau.inspect', 'luau.compare', 'luau.diff',
+    'luau.scan', 'luau.inspect', 'luau.compare', 'luau.diff', 'luau.pattern',
   ]);
   const readOnly = readOnlyTools.has(canonicalName);
   return {
@@ -144,6 +223,12 @@ const toolDefinitions = [
     canonicalName: 'workspace.coverage',
     aliases: ['workspace.coverage', 'workspace_coverage'],
     description: 'Show which Luau files have brain notes and which are uncovered.',
+    inputSchema: { type: 'object', properties: {}, additionalProperties: false },
+  },
+  {
+    canonicalName: 'workspace.audit',
+    aliases: ['workspace.audit', 'workspace_audit'],
+    description: 'Combined workspace health audit: pcall coverage, local pressure, legacy API usage, unbounded loops — prioritized action list.',
     inputSchema: { type: 'object', properties: {}, additionalProperties: false },
   },
   // ── Brain ──────────────────────────────────────────────────────────────────
@@ -229,6 +314,36 @@ const toolDefinitions = [
     },
   },
   {
+    canonicalName: 'brain.update',
+    aliases: ['brain.update', 'brain_update'],
+    description: 'Edit the title, summary, evidence, or scope of an existing brain note by its ID.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        id: { type: 'string' },
+        title: { type: 'string' },
+        summary: { type: 'string' },
+        evidence: { type: 'string' },
+        scope: { type: 'string' },
+      },
+      required: ['id'],
+      additionalProperties: false,
+    },
+  },
+  {
+    canonicalName: 'brain.delete',
+    aliases: ['brain.delete', 'brain_delete'],
+    description: 'Permanently delete a brain note by its ID.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        id: { type: 'string' },
+      },
+      required: ['id'],
+      additionalProperties: false,
+    },
+  },
+  {
     canonicalName: 'brain.export',
     aliases: ['brain.export', 'brain_export'],
     description: 'Export all brain notes to Markdown, grouped by scope.',
@@ -279,6 +394,22 @@ const toolDefinitions = [
         pathB: { type: 'string' },
       },
       required: ['pathA', 'pathB'],
+      additionalProperties: false,
+    },
+  },
+  {
+    canonicalName: 'luau.pattern',
+    aliases: ['luau.pattern', 'luau_pattern'],
+    description: 'Search for a regex pattern across all Luau files. Returns file, line, and matched text.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        pattern: { type: 'string', description: 'Regex pattern or literal string to search for.' },
+        maxResults: { type: 'number', description: 'Max matches to return (default 100).' },
+        context: { type: 'number', description: 'Lines of context around each match (default 0).' },
+        fileFilter: { type: 'string', description: 'Optional filename substring to filter which files are searched.' },
+      },
+      required: ['pattern'],
       additionalProperties: false,
     },
   },
@@ -394,6 +525,9 @@ export function handleTool(workspaceRoot, requestedName, args = {}) {
     case 'workspace.coverage':
       return textResult(jsonText(workspaceCoverage(workspaceRoot)));
 
+    case 'workspace.audit':
+      return textResult(jsonText(workspaceAudit(workspaceRoot)));
+
     case 'brain.add': {
       const snapshot = appendBrainNote(workspaceRoot, {
         title: args.title,
@@ -436,6 +570,21 @@ export function handleTool(workspaceRoot, requestedName, args = {}) {
       return textResult(jsonText(result));
     }
 
+    case 'brain.update': {
+      const result = updateBrainNote(workspaceRoot, args.id, {
+        title: args.title,
+        summary: args.summary,
+        evidence: args.evidence,
+        scope: args.scope,
+      });
+      return textResult(jsonText(result));
+    }
+
+    case 'brain.delete': {
+      const result = deleteBrainNote(workspaceRoot, args.id);
+      return textResult(jsonText(result));
+    }
+
     case 'brain.export':
       return textResult(exportBrainToMarkdown(workspaceRoot));
 
@@ -459,6 +608,15 @@ export function handleTool(workspaceRoot, requestedName, args = {}) {
     case 'luau.diff': {
       const report = diffLuauFiles(workspaceRoot, args.pathA, args.pathB);
       return textResult(jsonText(report));
+    }
+
+    case 'luau.pattern': {
+      const result = patternSearchLuau(workspaceRoot, args.pattern, {
+        maxResults: args.maxResults,
+        context: args.context,
+        fileFilter: args.fileFilter,
+      });
+      return textResult(jsonText(result));
     }
 
     case 'luau.note': {

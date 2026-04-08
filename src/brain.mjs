@@ -306,3 +306,30 @@ export function brainResourceText(root) {
 
   return lines.join('\n');
 }
+
+export function deleteBrainNote(root, id) {
+  const notes = loadNotes(root);
+  const idx = notes.findIndex((n) => n.id === id);
+  if (idx === -1) return { ok: false, error: `Note not found: ${id}` };
+  const removed = notes[idx];
+  notes.splice(idx, 1);
+  rebuildNotesFile(root, notes);
+  const snapshot = rebuildCurrentSnapshot(root, notes);
+  return { ok: true, removed: { id: removed.id, title: removed.title }, counts: snapshot.counts };
+}
+
+export function updateBrainNote(root, id, fields = {}) {
+  const notes = loadNotes(root);
+  const idx = notes.findIndex((n) => n.id === id);
+  if (idx === -1) return { ok: false, error: `Note not found: ${id}` };
+  const allowed = ['title', 'summary', 'evidence', 'scope'];
+  const updates = {};
+  for (const key of allowed) {
+    if (fields[key] !== undefined) updates[key] = String(fields[key]).trim();
+  }
+  if (Object.keys(updates).length === 0) return { ok: false, error: 'No updatable fields provided (allowed: title, summary, evidence, scope).' };
+  notes[idx] = { ...notes[idx], ...updates, updatedAt: new Date().toISOString() };
+  rebuildNotesFile(root, notes);
+  const snapshot = rebuildCurrentSnapshot(root, notes);
+  return { ok: true, note: notes[idx], counts: snapshot.counts };
+}

@@ -249,3 +249,60 @@ export function formatLuauAnalysis(report) {
 
   return lines.join('\n').trimEnd() + '\n';
 }
+
+/**
+ * Search for a regex pattern across all Luau files in the workspace.
+ * Returns matches with file, line number, matched text, and optional context lines.
+ */
+export function patternSearchLuau(root, rawPattern, { maxResults = 100, context = 0, fileFilter } = {}) {
+  let regex;
+  try {
+    regex = new RegExp(rawPattern, 'i');
+  } catch {
+    // Treat as literal string if invalid regex
+    regex = new RegExp(rawPattern.replace(/[.*+?^${}()|[\]\\]/g, '\\$&'), 'i');
+  }
+
+  const files = walkFiles(root, (filePath) => {
+    const ext = path.extname(filePath).toLowerCase();
+    if (!LUau_EXTENSIONS.has(ext)) return false;
+    if (fileFilter) {
+      const name = path.basename(filePath);
+      return name.toLowerCase().includes(String(fileFilter).toLowerCase());
+    }
+    return true;
+  });
+
+  const matches = [];
+
+  for (const file of files) {
+    if (matches.length >= maxResults) break;
+    const text = readText(file);
+    if (!text) continue;
+    const lines = text.split(/\r?\n/);
+    const relPath = toPosix(relative(root, file));
+
+    for (let i = 0; i < lines.length; i++) {
+      if (matches.length >= maxResults) break;
+      if (!regex.test(lines[i])) continue;
+
+      const before = context > 0 ? lines.slice(Math.max(0, i - context), i).map((l, o) => ({ line: i - context + o + 1, text: l })) : [];
+      const after = context > 0 ? lines.slice(i + 1, Math.min(lines.length, i + 1 + context)).map((l, o) => ({ line: i + 2 + o, text: l })) : [];
+
+      matches.push({
+        file: relPath,
+        line: i + 1,
+        text: lines[i],
+        before,
+        after,
+      });
+    }
+  }
+
+  return {
+    pattern: rawPattern,
+    totalMatches: matches.length,
+    capped: matches.length >= maxResults,
+    matches,
+  };
+}
