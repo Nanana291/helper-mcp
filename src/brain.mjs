@@ -332,7 +332,11 @@ export function brainHistory(root, { noteId = '', limit = 100 } = {}) {
     })
     .filter(Boolean)
     .filter((entry) => !noteId || entry.noteId === noteId || entry.note?.id === noteId || entry.before?.id === noteId || entry.after?.id === noteId)
-    .sort((a, b) => String(a.generatedAt || '').localeCompare(String(b.generatedAt || '')));
+    .sort((a, b) => {
+      const left = String(a.after?.updatedAt || a.note?.updatedAt || a.before?.updatedAt || a.generatedAt || '');
+      const right = String(b.after?.updatedAt || b.note?.updatedAt || b.before?.updatedAt || b.generatedAt || '');
+      return right.localeCompare(left);
+    });
 
   return {
     total: entries.length,
@@ -562,6 +566,10 @@ export function mergeBrainNotes(root, { noteId = '', mergeIds = [], apply = fals
         .filter((pair) => pair.similarity > 0.5)
         .sort((a, b) => b.similarity - a.similarity)
         .slice(0, Math.max(1, Number(limit) || 5));
+
+  if (apply && (!primary || mergeIds.length === 0)) {
+    return { ok: false, error: 'apply requires noteId and mergeIds.' };
+  }
 
   if (!apply || !primary || mergeIds.length === 0) {
     return {

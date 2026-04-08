@@ -44,7 +44,7 @@ import { captureWorkspaceBaseline, generateWorkspaceChangelog } from './workspac
 import { readText, toPosix, writeText } from './fs.mjs';
 
 export const serverName = 'helper-mcp';
-export const serverVersion = '0.5.5';
+export const serverVersion = '0.6.0';
 
 function jsonText(value) {
   return JSON.stringify(value, null, 2);

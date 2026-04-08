@@ -68,6 +68,41 @@ function getMatches(lines, pattern) {
   return matches;
 }
 
+function annotateFinding(category, label) {
+  const base = { severity: 'info', confidence: 0.5 };
+  if (category === 'risks') {
+    if (label === 'missing-pcall') return { severity: 'high', confidence: 0.97 };
+    if (label === 'unbounded-loop') return { severity: 'high', confidence: 0.93 };
+    if (label === 'repeat-wait') return { severity: 'medium', confidence: 0.82 };
+    if (label === 'wait' || label === 'spawn' || label === 'delay') return { severity: 'medium', confidence: 0.75 };
+    return { severity: 'medium', confidence: 0.7 };
+  }
+  if (category === 'security') {
+    if (label === 'webhook' || label === 'loadstring-remote' || label === 'backdoor-pattern') {
+      return { severity: 'high', confidence: 0.96 };
+    }
+    if (label === 'token-exfil') return { severity: 'high', confidence: 0.91 };
+    return { severity: 'medium', confidence: 0.8 };
+  }
+  if (category === 'performance') {
+    if (label === 'hot-loop' || label === 'repeat-loop' || label === 'nested-wait') {
+      return { severity: 'medium', confidence: 0.85 };
+    }
+    if (label === 'connect-without-cleanup') return { severity: 'medium', confidence: 0.82 };
+    return { severity: 'low', confidence: 0.68 };
+  }
+  if (category === 'obfuscation') {
+    return { severity: 'medium', confidence: 0.72 };
+  }
+  if (category === 'callbacks' || category === 'remotes') {
+    return { severity: 'info', confidence: 0.76 };
+  }
+  if (category === 'state' || category === 'ui') {
+    return { severity: 'info', confidence: 0.65 };
+  }
+  return base;
+}
+
 /**
  * Detect FireServer / InvokeServer calls that are NOT wrapped in pcall on the same line.
  */
@@ -115,13 +150,13 @@ function analyzeWithPatterns(text, filePath, patterns) {
   const patternSet = getPatternSet(patterns);
 
   const categories = {
-    callbacks: patternSet.callbacks.flatMap((pattern) => getMatches(lines, pattern).map((match) => ({ ...match, label: pattern.label }))),
-    remotes: patternSet.remotes.flatMap((pattern) => getMatches(lines, pattern).map((match) => ({ ...match, label: pattern.label }))),
-    state: patternSet.state.flatMap((pattern) => getMatches(lines, pattern).map((match) => ({ ...match, label: pattern.label }))),
-    ui: patternSet.ui.flatMap((pattern) => getMatches(lines, pattern).map((match) => ({ ...match, label: pattern.label }))),
+    callbacks: patternSet.callbacks.flatMap((pattern) => getMatches(lines, pattern).map((match) => ({ ...match, label: pattern.label, ...annotateFinding('callbacks', pattern.label) }))),
+    remotes: patternSet.remotes.flatMap((pattern) => getMatches(lines, pattern).map((match) => ({ ...match, label: pattern.label, ...annotateFinding('remotes', pattern.label) }))),
+    state: patternSet.state.flatMap((pattern) => getMatches(lines, pattern).map((match) => ({ ...match, label: pattern.label, ...annotateFinding('state', pattern.label) }))),
+    ui: patternSet.ui.flatMap((pattern) => getMatches(lines, pattern).map((match) => ({ ...match, label: pattern.label, ...annotateFinding('ui', pattern.label) }))),
     risks: [
-      ...patternSet.risks.flatMap((pattern) => getMatches(lines, pattern).map((match) => ({ ...match, label: pattern.label }))),
-      ...getMissingPcallMatches(lines),
+      ...patternSet.risks.flatMap((pattern) => getMatches(lines, pattern).map((match) => ({ ...match, label: pattern.label, ...annotateFinding('risks', pattern.label) }))),
+      ...getMissingPcallMatches(lines).map((match) => ({ ...match, ...annotateFinding('risks', match.label) })),
     ],
   };
 
@@ -896,7 +931,11 @@ export function scanLuauSecurity(text, filePath = '') {
       findingCount: findings.length,
       highRiskCount: findings.filter((finding) => /webhook|loadstring-remote|backdoor-pattern|token-exfil/i.test(finding.label)).length,
     },
-    findings,
+    findings: findings.map((finding) => ({
+      ...finding,
+      severity: /webhook|loadstring-remote|backdoor-pattern|token-exfil/i.test(finding.label) ? 'high' : 'medium',
+      confidence: /webhook|loadstring-remote|backdoor-pattern/i.test(finding.label) ? 0.96 : 0.88,
+    })),
   };
 }
 
@@ -927,7 +966,11 @@ export function profileLuauPerformance(text, filePath = '') {
       loopCount: findings.filter((finding) => /hot-loop|repeat-loop|nested-wait/.test(finding.label)).length,
       cleanupIssues: findings.filter((finding) => finding.label === 'connect-without-cleanup').length,
     },
-    findings,
+    findings: findings.map((finding) => ({
+      ...finding,
+      severity: /hot-loop|repeat-loop|nested-wait/i.test(finding.label) ? 'medium' : 'low',
+      confidence: /connect-without-cleanup/i.test(finding.label) ? 0.82 : 0.85,
+    })),
   };
 }
 
@@ -958,7 +1001,11 @@ export function decompileLuauHeuristics(text, filePath = '') {
       findingCount: findings.length,
       sourceHash: crypto.createHash('sha256').update(source, 'utf8').digest('hex'),
     },
-    findings,
+    findings: findings.map((finding) => ({
+      ...finding,
+      severity: 'medium',
+      confidence: /loader/i.test(finding.label) ? 0.9 : 0.72,
+    })),
     strings,
     remoteHints: lines
       .map((line, index) => ({ line: index + 1, text: line.trim() }))

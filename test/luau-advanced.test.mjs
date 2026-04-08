@@ -6,6 +6,7 @@ import { test } from 'node:test';
 import { handleTool } from '../src/core.mjs';
 import { captureLuauMetrics } from '../src/metrics.mjs';
 import {
+  analyzeLuauText,
   buildLuauDependencyMap,
   buildLuauRemoteGraph,
   repairLuauRisk,
@@ -46,6 +47,10 @@ test('luau repair, dependency graph, remote graph, complexity, metrics, and chan
     const repair = repairLuauRisk('Remote:FireServer("hello")\n', clientPath, 'missing-pcall');
     assert.match(repair.after, /pcall/);
     assert.match(repair.explanation, /remote call/i);
+
+    const analyzed = analyzeLuauText('Remote:FireServer("hello")\n', clientPath);
+    assert.equal(analyzed.categories.risks[0].severity, 'high');
+    assert.ok(analyzed.categories.risks[0].confidence > 0.9);
 
     const dependencies = buildLuauDependencyMap(root);
     assert.ok(dependencies.summary.scriptCount >= 4);

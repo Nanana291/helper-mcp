@@ -41,12 +41,16 @@ test('brain history tracks status changes and merge deduplicates similar notes',
 
     const history = brainHistory(root, { noteId: primary.id });
     assert.ok(history.total >= 2);
+    assert.equal(history.events[0].action, 'update');
     assert.ok(history.events.some((event) => event.action === 'promote'));
     assert.ok(history.events.some((event) => event.action === 'update'));
 
     const suggestions = mergeBrainNotes(root, { noteId: primary.id });
     assert.ok(suggestions.ok);
     assert.ok(suggestions.candidates.some((candidate) => candidate.id === duplicate.id));
+
+    const rejected = mergeBrainNotes(root, { noteId: primary.id, apply: true });
+    assert.equal(rejected.ok, false);
 
     const merged = mergeBrainNotes(root, { noteId: primary.id, mergeIds: [duplicate.id], apply: true });
     assert.ok(merged.ok);
