@@ -2,6 +2,7 @@ import fs from 'node:fs';
 import path from 'node:path';
 import crypto from 'node:crypto';
 import { readText, relative, toPosix, walkFiles, writeText } from './fs.mjs';
+import { loadLuauPatterns, defaultLuauPatterns } from './patterns.mjs';
 
 const LUAU_EXTENSIONS = new Set(['.lua', '.luau']);
 
@@ -92,20 +93,34 @@ function textHash(text) {
   return crypto.createHash('sha256').update(String(text || ''), 'utf8').digest('hex');
 }
 
-export function analyzeLuauText(text, filePath = '') {
+function getPatternSet(patterns = defaultLuauPatterns) {
+  return {
+    callbacks: patterns.callbacks || [],
+    remotes: patterns.remotes || [],
+    state: patterns.state || [],
+    ui: patterns.ui || [],
+    risks: patterns.risks || [],
+    performance: patterns.performance || [],
+    security: patterns.security || [],
+    obfuscation: patterns.obfuscation || [],
+  };
+}
+
+function analyzeWithPatterns(text, filePath, patterns) {
   const source = String(text || '');
   const lines = source.split(/\r?\n/);
 
   // Count local declarations as a register-pressure heuristic
   const localCount = lines.filter((l) => /^\s*local\s+/.test(l)).length;
+  const patternSet = getPatternSet(patterns);
 
   const categories = {
-    callbacks: callbackPatterns.flatMap((pattern) => getMatches(lines, pattern).map((match) => ({ ...match, label: pattern.label }))),
-    remotes: remotePatterns.flatMap((pattern) => getMatches(lines, pattern).map((match) => ({ ...match, label: pattern.label }))),
-    state: statePatterns.flatMap((pattern) => getMatches(lines, pattern).map((match) => ({ ...match, label: pattern.label }))),
-    ui: uiPatterns.flatMap((pattern) => getMatches(lines, pattern).map((match) => ({ ...match, label: pattern.label }))),
+    callbacks: patternSet.callbacks.flatMap((pattern) => getMatches(lines, pattern).map((match) => ({ ...match, label: pattern.label }))),
+    remotes: patternSet.remotes.flatMap((pattern) => getMatches(lines, pattern).map((match) => ({ ...match, label: pattern.label }))),
+    state: patternSet.state.flatMap((pattern) => getMatches(lines, pattern).map((match) => ({ ...match, label: pattern.label }))),
+    ui: patternSet.ui.flatMap((pattern) => getMatches(lines, pattern).map((match) => ({ ...match, label: pattern.label }))),
     risks: [
-      ...riskPatterns.flatMap((pattern) => getMatches(lines, pattern).map((match) => ({ ...match, label: pattern.label }))),
+      ...patternSet.risks.flatMap((pattern) => getMatches(lines, pattern).map((match) => ({ ...match, label: pattern.label }))),
       ...getMissingPcallMatches(lines),
     ],
   };
@@ -138,7 +153,12 @@ export function analyzeLuauText(text, filePath = '') {
   return { summary, categories };
 }
 
+export function analyzeLuauText(text, filePath = '', patterns = defaultLuauPatterns) {
+  return analyzeWithPatterns(text, filePath, patterns);
+}
+
 export function scanLuauWorkspace(root) {
+  const patterns = loadLuauPatterns(root);
   const files = walkFiles(root, (filePath) => {
     const ext = path.extname(filePath).toLowerCase();
     return LUAU_EXTENSIONS.has(ext);
@@ -146,7 +166,7 @@ export function scanLuauWorkspace(root) {
 
   const analyzed = files.map((filePath) => ({
     filePath: toPosix(relative(root, filePath)),
-    ...analyzeLuauText(readText(filePath), filePath),
+    ...analyzeLuauText(readText(filePath), filePath, patterns),
   }));
 
   return {
@@ -615,6 +635,240 @@ export function migrationChecklist(root, oldPath, newPath) {
     blockers: blockers.length,
     warnings: warnings.length,
     checklist,
+  };
+}
+
+export function buildLuauMigrationChangelog(result, { title = 'Luau migration changelog' } = {}) {
+  const lines = [];
+  lines.push(`# ${title}`);
+  lines.push('');
+  lines.push(`Verdict: ${result.verdict}`);
+  lines.push(`Old: ${result.paths.old}`);
+  lines.push(`New: ${result.paths.new}`);
+  lines.push('');
+  lines.push(`Blockers: ${result.blockers}`);
+  lines.push(`Warnings: ${result.warnings}`);
+  lines.push('');
+
+  if (result.checklist.length > 0) {
+    lines.push('## Checklist');
+    for (const item of result.checklist) {
+      const state = item.pass ? 'PASS' : 'FAIL';
+      lines.push(`- [${state}] ${item.check}: ${item.detail}`);
+    }
+    lines.push('');
+  }
+
+  return `${lines.join('\n').trimEnd()}\n`;
+}
+
+function describeRepair(label, beforeLine, afterLine) {
+  switch (label) {
+    case 'missing-pcall':
+      return {
+        explanation: 'Wrap the remote call in pcall so failures do not crash the script.',
+        before: beforeLine,
+        after: `pcall(function()\n  ${beforeLine.trim()}\nend)`,
+      };
+    case 'wait':
+      return {
+        explanation: 'Replace legacy wait() with task.wait() to match modern Luau scheduling.',
+        before: beforeLine,
+        after: beforeLine.replace(/\bwait\s*\(/g, 'task.wait('),
+      };
+    case 'spawn':
+      return {
+        explanation: 'Replace spawn() with task.spawn() to avoid legacy scheduler behavior.',
+        before: beforeLine,
+        after: beforeLine.replace(/\bspawn\s*\(/g, 'task.spawn('),
+      };
+    case 'unbounded-loop':
+      return {
+        explanation: 'Add a bounded loop or explicit exit condition before shipping this code path.',
+        before: beforeLine,
+        after: afterLine || '-- add a termination condition or iteration limit here',
+      };
+    case 'connection-cleanup':
+      return {
+        explanation: 'Track connections and disconnect them during teardown to prevent leaks.',
+        before: beforeLine,
+        after: 'local connections = {}\nlocal function track(connection)\n  connections[#connections + 1] = connection\n  return connection\nend',
+      };
+    case 'remote-rate-limit':
+      return {
+        explanation: 'Throttle repeated remote calls so the script does not spam the server.',
+        before: beforeLine,
+        after: `task.wait(0.15)\n${beforeLine}`,
+      };
+    default:
+      return {
+        explanation: 'No specific repair rule matched; review the line manually.',
+        before: beforeLine,
+        after: beforeLine,
+      };
+  }
+}
+
+export function repairLuauRisk(text, filePath = '', riskLabel = '') {
+  const source = String(text || '');
+  const lines = source.split(/\r?\n/);
+  const label = String(riskLabel || '').trim().toLowerCase();
+  let lineIndex = lines.findIndex((line) => {
+    if (label === 'wait') return /\bwait\s*\(/i.test(line);
+    if (label === 'spawn') return /\bspawn\s*\(/i.test(line);
+    if (label === 'missing-pcall') return /:((FireServer)|(InvokeServer))\s*\(/i.test(line) && !/\bpcall\b/i.test(line);
+    if (label === 'unbounded-loop') return /\bwhile\s+true\s+do\b/i.test(line);
+    if (label === 'connection-cleanup') return /\bConnect\s*\(/i.test(line);
+    if (label === 'remote-rate-limit') return /:((FireServer)|(InvokeServer))\s*\(/i.test(line);
+    return false;
+  });
+  if (lineIndex === -1) {
+    lineIndex = 0;
+  }
+  const beforeLine = lines[lineIndex] || '';
+  const repair = describeRepair(label, beforeLine, lines[lineIndex + 1] || '');
+  const snippetLines = [
+    ...lines.slice(Math.max(0, lineIndex - 1), lineIndex),
+    repair.after,
+    ...lines.slice(lineIndex + 1, Math.min(lines.length, lineIndex + 2)),
+  ].filter(Boolean);
+  return {
+    summary: {
+      filePath: toPosix(filePath),
+      riskLabel: label,
+      line: lineIndex + 1,
+      sourceHash: crypto.createHash('sha256').update(source, 'utf8').digest('hex'),
+    },
+    explanation: repair.explanation,
+    before: beforeLine,
+    after: repair.after,
+    snippet: snippetLines.join('\n'),
+  };
+}
+
+export function buildLuauRemoteGraph(root, targetPath = '') {
+  const files = walkFiles(root, (filePath) => {
+    const ext = path.extname(filePath).toLowerCase();
+    if (!LUAU_EXTENSIONS.has(ext)) return false;
+    if (!targetPath) return true;
+    const rel = toPosix(relative(root, filePath));
+    const target = toPosix(targetPath);
+    return rel === target || rel.startsWith(`${target}/`);
+  });
+
+  const remotes = new Map();
+  const register = (name, filePath, line, kind, text) => {
+    if (!name) return;
+    if (!remotes.has(name)) {
+      remotes.set(name, { name, kinds: new Set(), uses: [], handlers: [], files: new Set() });
+    }
+    const remote = remotes.get(name);
+    remote.kinds.add(kind);
+    remote.files.add(toPosix(relative(root, filePath)));
+    const entry = { filePath: toPosix(relative(root, filePath)), line, text };
+    if (/onserverevent|onclientevent/i.test(kind)) remote.handlers.push(entry); else remote.uses.push(entry);
+  };
+
+  for (const filePath of files) {
+    const text = readText(filePath);
+    const lines = text.split(/\r?\n/);
+    for (let i = 0; i < lines.length; i += 1) {
+      const line = lines[i];
+      const assign = /local\s+([A-Za-z_][A-Za-z0-9_]*)\s*=\s*.*\b(RemoteEvent|RemoteFunction)\b/i.exec(line);
+      if (assign) {
+        register(assign[1], filePath, i + 1, assign[2].toLowerCase(), line.trim());
+      }
+      const waitForChild = /local\s+([A-Za-z_][A-Za-z0-9_]*)\s*=\s*.*WaitForChild\s*\(\s*["']([^"']+)["']\s*\)/i.exec(line);
+      if (waitForChild) {
+        register(waitForChild[1], filePath, i + 1, 'waitforchild', line.trim());
+      }
+      const fireMatch = /([A-Za-z_][A-Za-z0-9_]*)\s*:\s*(FireServer|InvokeServer|FireClient)\s*\(/.exec(line);
+      if (fireMatch) {
+        register(fireMatch[1], filePath, i + 1, fireMatch[2].toLowerCase(), line.trim());
+      }
+      const handlerMatch = /([A-Za-z_][A-Za-z0-9_]*)\s*\.\s*(OnServerEvent|OnClientEvent)\b/.exec(line);
+      if (handlerMatch) {
+        register(handlerMatch[1], filePath, i + 1, handlerMatch[2].toLowerCase(), line.trim());
+      }
+    }
+  }
+
+  const entries = [...remotes.values()].map((remote) => {
+    const kinds = [...remote.kinds];
+    const hasServerHandler = remote.handlers.some((entry) => /OnServerEvent/i.test(entry.text));
+    const hasClientHandler = remote.handlers.some((entry) => /OnClientEvent/i.test(entry.text));
+    const kind = kinds.includes('remotefunction') || kinds.includes('invokeserver') ? 'function' : 'event';
+    return {
+      name: remote.name,
+      kind,
+      kinds,
+      files: [...remote.files],
+      uses: remote.uses,
+      handlers: remote.handlers,
+      hasServerHandler,
+      hasClientHandler,
+      orphaned: remote.uses.length > 0 && remote.handlers.length === 0,
+    };
+  }).sort((a, b) => a.name.localeCompare(b.name));
+
+  return {
+    summary: {
+      fileCount: files.length,
+      remoteCount: entries.length,
+      orphanedCount: entries.filter((entry) => entry.orphaned).length,
+      handlerCount: entries.reduce((sum, entry) => sum + entry.handlers.length, 0),
+    },
+    remotes: entries,
+  };
+}
+
+export function scoreLuauComplexity(text, filePath = '') {
+  const source = String(text || '');
+  const lines = source.split(/\r?\n/);
+  const functions = [];
+  const starts = [];
+  for (let i = 0; i < lines.length; i += 1) {
+    const line = lines[i];
+    if (/\b(function\s+[A-Za-z_][A-Za-z0-9_\.:\[\]]*|local\s+function\s+[A-Za-z_][A-Za-z0-9_]*|=\s*function\s*\()/i.test(line)) {
+      starts.push(i);
+    }
+  }
+
+  for (const start of starts) {
+    let depth = 1;
+    let end = lines.length - 1;
+    for (let i = start + 1; i < lines.length; i += 1) {
+      const line = lines[i];
+      depth += (line.match(/\b(function|if|for|while|repeat|do|then)\b/gi) || []).length;
+      depth -= (line.match(/\b(end|until)\b/gi) || []).length;
+      if (depth <= 0) {
+        end = i;
+        break;
+      }
+    }
+    const body = lines.slice(start, end + 1).join('\n');
+    const branchCount = (body.match(/\b(if|elseif|for|while|repeat|and|or|case)\b/gi) || []).length;
+    const name = (lines[start].match(/local\s+function\s+([A-Za-z_][A-Za-z0-9_]*)/i)?.[1])
+      || (lines[start].match(/function\s+([A-Za-z_][A-Za-z0-9_\.:\[\]]*)/i)?.[1])
+      || `line_${start + 1}`;
+    functions.push({
+      name,
+      startLine: start + 1,
+      endLine: end + 1,
+      complexity: 1 + branchCount,
+      branchCount,
+      text: lines.slice(start, end + 1).join('\n').trim(),
+    });
+  }
+
+  return {
+    summary: {
+      filePath: toPosix(filePath),
+      functionCount: functions.length,
+      maxComplexity: functions.reduce((max, entry) => Math.max(max, entry.complexity), 0),
+      averageComplexity: functions.length > 0 ? Number((functions.reduce((sum, entry) => sum + entry.complexity, 0) / functions.length).toFixed(2)) : 0,
+    },
+    functions: functions.sort((a, b) => b.complexity - a.complexity || a.startLine - b.startLine),
   };
 }
 

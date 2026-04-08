@@ -10,6 +10,7 @@ function brainPaths(root) {
     dir: base,
     notes: path.join(base, 'notes.jsonl'),
     current: path.join(base, 'current.json'),
+    history: path.join(base, 'history.jsonl'),
   };
 }
 
@@ -38,6 +39,29 @@ function rebuildNotesFile(root, notes) {
   const { dir, notes: notesPath } = brainPaths(root);
   fs.mkdirSync(dir, { recursive: true });
   fs.writeFileSync(notesPath, notes.map((n) => JSON.stringify(n)).join('\n') + '\n', 'utf8');
+}
+
+function appendBrainHistory(root, event) {
+  const { dir, history } = brainPaths(root);
+  fs.mkdirSync(dir, { recursive: true });
+  fs.appendFileSync(history, `${JSON.stringify({
+    kind: 'helper-mcp-brain-event',
+    generatedAt: new Date().toISOString(),
+    ...event,
+  })}\n`, 'utf8');
+}
+
+function compareNoteText(a, b) {
+  const left = normalizeText(`${a.title || ''} ${a.summary || ''} ${(Array.isArray(a.tags) ? a.tags : []).join(' ')} ${a.evidence || ''}`);
+  const right = normalizeText(`${b.title || ''} ${b.summary || ''} ${(Array.isArray(b.tags) ? b.tags : []).join(' ')} ${b.evidence || ''}`);
+  if (!left || !right) return 0;
+  const leftTokens = new Set(left.split(/\s+/).filter(Boolean));
+  const rightTokens = new Set(right.split(/\s+/).filter(Boolean));
+  let overlap = 0;
+  for (const token of leftTokens) {
+    if (rightTokens.has(token)) overlap++;
+  }
+  return overlap / Math.max(leftTokens.size, rightTokens.size, 1);
 }
 
 export function summarizeBrainNotes(notes) {
@@ -95,6 +119,7 @@ export function appendBrainNote(root, note) {
   };
   fs.mkdirSync(dir, { recursive: true });
   fs.appendFileSync(notes, `${JSON.stringify(normalized)}\n`, 'utf8');
+  appendBrainHistory(root, { action: 'append', note: normalized });
   return rebuildCurrentSnapshot(root, loadNotes(root));
 }
 
@@ -102,9 +127,11 @@ export function promoteBrainNote(root, id, newStatus) {
   const notes = loadNotes(root);
   const idx = notes.findIndex((n) => n.id === id);
   if (idx === -1) return { ok: false, error: `Note not found: ${id}` };
+  const before = notes[idx];
   notes[idx] = { ...notes[idx], status: String(newStatus || 'active').trim().toLowerCase(), updatedAt: new Date().toISOString() };
   rebuildNotesFile(root, notes);
   const snapshot = rebuildCurrentSnapshot(root, notes);
+  appendBrainHistory(root, { action: 'promote', noteId: id, before, after: notes[idx] });
   return { ok: true, note: notes[idx], counts: snapshot.counts };
 }
 
@@ -114,9 +141,11 @@ export function tagBrainNote(root, id, tagsToAdd) {
   if (idx === -1) return { ok: false, error: `Note not found: ${id}` };
   const existing = Array.isArray(notes[idx].tags) ? notes[idx].tags : [];
   const merged = [...new Set([...existing, ...tagsToAdd.map(String).map((t) => t.trim()).filter(Boolean)])];
+  const before = notes[idx];
   notes[idx] = { ...notes[idx], tags: merged, updatedAt: new Date().toISOString() };
   rebuildNotesFile(root, notes);
   const snapshot = rebuildCurrentSnapshot(root, notes);
+  appendBrainHistory(root, { action: 'tag', noteId: id, before, after: notes[idx], tagsAdded: tagsToAdd });
   return { ok: true, note: notes[idx], counts: snapshot.counts };
 }
 
@@ -285,6 +314,43 @@ export function loadBrainSnapshot(root) {
   return rebuildCurrentSnapshot(root, notes);
 }
 
+export function brainHistory(root, { noteId = '', limit = 100 } = {}) {
+  const { history } = brainPaths(root);
+  if (!fs.existsSync(history)) {
+    return { total: 0, events: [] };
+  }
+  const entries = readText(history)
+    .split(/\r?\n/)
+    .map((line) => line.trim())
+    .filter(Boolean)
+    .map((line) => {
+      try {
+        return JSON.parse(line);
+      } catch {
+        return null;
+      }
+    })
+    .filter(Boolean)
+    .filter((entry) => !noteId || entry.noteId === noteId || entry.note?.id === noteId || entry.before?.id === noteId || entry.after?.id === noteId)
+    .sort((a, b) => String(a.generatedAt || '').localeCompare(String(b.generatedAt || '')));
+
+  return {
+    total: entries.length,
+    events: entries.slice(-Math.max(1, Number(limit) || 100)).map((entry) => ({
+      generatedAt: entry.generatedAt,
+      action: entry.action,
+      noteId: entry.noteId || entry.note?.id || entry.after?.id || entry.before?.id || '',
+      beforeStatus: entry.before?.status || '',
+      afterStatus: entry.after?.status || entry.note?.status || '',
+      beforeUpdatedAt: entry.before?.updatedAt || '',
+      afterUpdatedAt: entry.after?.updatedAt || entry.note?.updatedAt || '',
+      title: entry.after?.title || entry.note?.title || entry.before?.title || '',
+      note: entry.note || entry.after || entry.before || null,
+      tagsAdded: entry.tagsAdded || [],
+    })),
+  };
+}
+
 function inferTagsFromText(text) {
   const source = normalizeText(text);
   const tags = [];
@@ -417,6 +483,7 @@ export function importBrainNotes(root, sources = []) {
       counts: snapshot.counts,
     });
   }
+  appendBrainHistory(root, { action: 'import', imported: imported.map((entry) => entry.filePath) });
 
   return {
     importedCount: imported.length,
@@ -432,6 +499,7 @@ export function deleteBrainNote(root, id) {
   notes.splice(idx, 1);
   rebuildNotesFile(root, notes);
   const snapshot = rebuildCurrentSnapshot(root, notes);
+  appendBrainHistory(root, { action: 'delete', noteId: id, before: removed });
   return { ok: true, removed: { id: removed.id, title: removed.title }, counts: snapshot.counts };
 }
 
@@ -445,9 +513,11 @@ export function updateBrainNote(root, id, fields = {}) {
     if (fields[key] !== undefined) updates[key] = String(fields[key]).trim();
   }
   if (Object.keys(updates).length === 0) return { ok: false, error: 'No updatable fields provided (allowed: title, summary, evidence, scope).' };
+  const before = notes[idx];
   notes[idx] = { ...notes[idx], ...updates, updatedAt: new Date().toISOString() };
   rebuildNotesFile(root, notes);
   const snapshot = rebuildCurrentSnapshot(root, notes);
+  appendBrainHistory(root, { action: 'update', noteId: id, before, after: notes[idx], fields: updates });
   return { ok: true, note: notes[idx], counts: snapshot.counts };
 }
 
@@ -467,5 +537,72 @@ export function teachBrainLesson(root, { mistake, fix, rule, sourcePath, tags })
     sourcePath: String(sourcePath || '').trim(),
     evidence: String(mistake).trim(),
   });
+  appendBrainHistory(root, { action: 'teach', noteId: snapshot?.notes?.at?.(-1)?.id || '', mistake: String(mistake).trim(), rule: String(rule).trim() });
   return { ok: true, message: 'Lesson stored.', counts: snapshot.counts };
+}
+
+export function mergeBrainNotes(root, { noteId = '', mergeIds = [], apply = false, limit = 5 } = {}) {
+  const notes = loadNotes(root);
+  const primary = noteId ? notes.find((note) => note.id === noteId) : null;
+  if (noteId && !primary) {
+    return { ok: false, error: `Note not found: ${noteId}` };
+  }
+
+  const candidates = primary
+    ? notes
+        .filter((note) => note.id !== primary.id)
+        .map((note) => ({ ...note, similarity: compareNoteText(primary, note) }))
+        .filter((note) => note.similarity > 0)
+        .sort((a, b) => b.similarity - a.similarity)
+        .slice(0, Math.max(1, Number(limit) || 5))
+    : notes
+        .flatMap((note) => notes
+          .filter((other) => other.id !== note.id)
+          .map((other) => ({ source: note, target: other, similarity: compareNoteText(note, other) })))
+        .filter((pair) => pair.similarity > 0.5)
+        .sort((a, b) => b.similarity - a.similarity)
+        .slice(0, Math.max(1, Number(limit) || 5));
+
+  if (!apply || !primary || mergeIds.length === 0) {
+    return {
+      ok: true,
+      mode: 'suggest',
+      primaryId: primary?.id || '',
+      candidates,
+    };
+  }
+
+  const ids = new Set([primary.id, ...mergeIds.map(String)]);
+  const selected = notes.filter((note) => ids.has(note.id));
+  if (selected.length < 2) {
+    return { ok: false, error: 'Need at least two notes to merge.' };
+  }
+
+  const mergedTags = [...new Set(selected.flatMap((note) => Array.isArray(note.tags) ? note.tags : []))];
+  const mergedSummary = selected.map((note) => note.summary).filter(Boolean).join('\n\n');
+  const mergedEvidence = selected.map((note) => note.evidence).filter(Boolean).join('\n\n');
+  const mergedSource = selected.map((note) => note.sourcePath).find(Boolean) || '';
+  const mergedNote = {
+    ...primary,
+    summary: mergedSummary || primary.summary,
+    evidence: mergedEvidence || primary.evidence,
+    tags: mergedTags,
+    sourcePath: mergedSource,
+    updatedAt: new Date().toISOString(),
+  };
+
+  const mergedNotes = notes
+    .filter((note) => !ids.has(note.id))
+    .concat(mergedNote);
+  rebuildNotesFile(root, mergedNotes);
+  const snapshot = rebuildCurrentSnapshot(root, mergedNotes);
+  appendBrainHistory(root, { action: 'merge', primaryId: primary.id, mergedIds: mergeIds, after: mergedNote });
+
+  return {
+    ok: true,
+    mode: 'merged',
+    primary: mergedNote,
+    mergedIds: mergeIds,
+    counts: snapshot.counts,
+  };
 }
