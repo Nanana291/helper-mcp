@@ -34,6 +34,10 @@ test('helper-mcp exposes compatibility aliases and resources', async () => {
     assert.ok(toolNames.includes('brain_graph'));
     assert.ok(toolNames.includes('brain_query_advanced'));
     assert.ok(toolNames.includes('brain_diff'));
+    assert.ok(toolNames.includes('brain_findings'));
+    assert.ok(toolNames.includes('brain_finding_history'));
+    assert.ok(toolNames.includes('brain_finding_graph'));
+    assert.ok(toolNames.includes('brain_finding_prune'));
     assert.ok(toolNames.includes('brain_link'));
     assert.ok(toolNames.includes('brain_archive'));
     assert.ok(toolNames.includes('brain_restore_diff'));
@@ -51,6 +55,8 @@ test('helper-mcp exposes compatibility aliases and resources', async () => {
     assert.ok(toolNames.includes('luau_handlers'));
     assert.ok(toolNames.includes('luau_surface'));
     assert.ok(toolNames.includes('luau_refactor'));
+    assert.ok(toolNames.includes('luau_findings'));
+    assert.ok(toolNames.includes('luau_brain_sync'));
     assert.ok(toolNames.includes('luau_modulegraph'));
     assert.ok(toolNames.includes('luau_risk_score'));
     assert.ok(toolNames.includes('luau_diff_context'));
@@ -81,8 +87,8 @@ test('helper-mcp exposes compatibility aliases and resources', async () => {
     const text = result.content.map((block) => block.text || '').join('\n');
 
     assert.match(text, /"ok": true/);
-    assert.match(text, /"version": "0.6.1"/);
-    assert.match(text, /"canonicalToolCount": 60/);
+    assert.match(text, /"version": "0.6.2"/);
+    assert.match(text, /"canonicalToolCount": 66/);
   } finally {
     await client.close?.();
     await transport.close();

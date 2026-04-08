@@ -1,3 +1,4 @@
+import crypto from 'node:crypto';
 import fs from 'node:fs';
 import path from 'node:path';
 import { normalizeText, readText, relative, walkFiles, writeText, toPosix } from './fs.mjs';
@@ -51,20 +52,7 @@ function appendBrainHistory(root, event) {
   })}\n`, 'utf8');
 }
 
-function compareNoteText(a, b) {
-  const left = normalizeText(`${a.title || ''} ${a.summary || ''} ${(Array.isArray(a.tags) ? a.tags : []).join(' ')} ${a.evidence || ''}`);
-  const right = normalizeText(`${b.title || ''} ${b.summary || ''} ${(Array.isArray(b.tags) ? b.tags : []).join(' ')} ${b.evidence || ''}`);
-  if (!left || !right) return 0;
-  const leftTokens = new Set(left.split(/\s+/).filter(Boolean));
-  const rightTokens = new Set(right.split(/\s+/).filter(Boolean));
-  let overlap = 0;
-  for (const token of leftTokens) {
-    if (rightTokens.has(token)) overlap++;
-  }
-  return overlap / Math.max(leftTokens.size, rightTokens.size, 1);
-}
-
-function loadBrainEvents(root) {
+function loadBrainHistoryEntries(root) {
   const { history } = brainPaths(root);
   if (!fs.existsSync(history)) {
     return [];
@@ -81,6 +69,147 @@ function loadBrainEvents(root) {
       }
     })
     .filter(Boolean);
+}
+
+function compareNoteText(a, b) {
+  const left = normalizeText(`${a.title || ''} ${a.summary || ''} ${(Array.isArray(a.tags) ? a.tags : []).join(' ')} ${a.evidence || ''}`);
+  const right = normalizeText(`${b.title || ''} ${b.summary || ''} ${(Array.isArray(b.tags) ? b.tags : []).join(' ')} ${b.evidence || ''}`);
+  if (!left || !right) return 0;
+  const leftTokens = new Set(left.split(/\s+/).filter(Boolean));
+  const rightTokens = new Set(right.split(/\s+/).filter(Boolean));
+  let overlap = 0;
+  for (const token of leftTokens) {
+    if (rightTokens.has(token)) overlap++;
+  }
+  return overlap / Math.max(leftTokens.size, rightTokens.size, 1);
+}
+
+function loadBrainEvents(root) {
+  return loadBrainHistoryEntries(root);
+}
+
+export function deriveFindingNoteId(finding = {}) {
+  const parts = [
+    String(finding.command || finding.sourceCommand || '').trim().toLowerCase(),
+    String(finding.filePath || finding.path || '').trim().toLowerCase(),
+    String(finding.line || 0).trim(),
+    String(finding.label || '').trim().toLowerCase(),
+    String(finding.evidence || finding.text || '').trim().toLowerCase(),
+  ];
+  return crypto.createHash('sha256').update(parts.join('|'), 'utf8').digest('hex');
+}
+
+function normalizeFindingStatus(severity) {
+  const value = String(severity || 'review').trim().toLowerCase();
+  if (value === 'high' || value === 'critical') return 'active';
+  if (value === 'review' || value === 'warning') return 'candidate';
+  return 'candidate';
+}
+
+function normalizeFindingTags(finding) {
+  const tags = Array.isArray(finding.tags) ? finding.tags : [];
+  return [...new Set([
+    'luau',
+    'finding',
+    String(finding.command || finding.sourceCommand || '').trim().toLowerCase(),
+    String(finding.severity || 'review').trim().toLowerCase(),
+    String(finding.label || '').trim().toLowerCase(),
+    ...tags.map((tag) => String(tag).trim().toLowerCase()).filter(Boolean),
+  ])].filter(Boolean);
+}
+
+export function appendBrainFindingHistory(root, event) {
+  appendBrainHistory(root, {
+    kind: 'helper-mcp-brain-finding-event',
+    ...event,
+  });
+}
+
+export function upsertBrainFindingNote(root, finding = {}) {
+  const notes = loadNotes(root);
+  const now = new Date().toISOString();
+  const noteId = deriveFindingNoteId(finding);
+  const existingIndex = notes.findIndex((note) => note.id === noteId || note.findingId === noteId);
+  const existing = existingIndex >= 0 ? notes[existingIndex] : null;
+  const sourceCommand = String(finding.command || finding.sourceCommand || '').trim();
+  const severity = String(finding.severity || 'review').trim().toLowerCase();
+  const confidence = Number(finding.confidence ?? finding.confidenceAverage ?? existing?.findingConfidence ?? 0);
+  const title = String(finding.title || `${finding.label || 'finding'} @ ${finding.filePath || 'workspace'}:${finding.line || 0}`).trim();
+  const summary = String(finding.summary || finding.evidence || finding.explanation || '').trim();
+  const updatedNote = {
+    kind: 'helper-mcp-brain-finding',
+    id: noteId,
+    findingId: noteId,
+    sourceCommand,
+    findingSeverity: severity,
+    findingConfidence: Number.isFinite(confidence) ? Number(confidence.toFixed(2)) : 0,
+    findingLabel: String(finding.label || '').trim(),
+    sourcePath: String(finding.filePath || finding.path || '').trim(),
+    line: Number(finding.line || 0),
+    title,
+    summary,
+    evidence: String(finding.evidence || finding.text || summary || '').trim(),
+    suggestedFix: String(finding.suggestedFix || finding.after || '').trim(),
+    status: normalizeFindingStatus(severity),
+    tags: normalizeFindingTags(finding),
+    links: Array.isArray(existing?.links) ? existing.links.slice() : [],
+    bridgeable: Boolean(finding.bridgeable !== false),
+    createdAt: existing?.createdAt || now,
+    updatedAt: now,
+    finding: {
+      command: sourceCommand,
+      filePath: String(finding.filePath || finding.path || '').trim(),
+      line: Number(finding.line || 0),
+      label: String(finding.label || '').trim(),
+      severity,
+      confidence: Number.isFinite(confidence) ? Number(confidence.toFixed(2)) : 0,
+      bridgeable: Boolean(finding.bridgeable !== false),
+    },
+  };
+
+  if (existingIndex >= 0) {
+    notes[existingIndex] = { ...existing, ...updatedNote, createdAt: existing.createdAt || updatedNote.createdAt };
+  } else {
+    notes.push(updatedNote);
+  }
+
+  rebuildNotesFile(root, notes);
+  const snapshot = rebuildCurrentSnapshot(root, notes);
+  appendBrainFindingHistory(root, {
+    action: existingIndex >= 0 ? 'bridge_update' : 'bridge_create',
+    findingId: noteId,
+    sourceCommand,
+    before: existing,
+    after: updatedNote,
+  });
+  return { ok: true, note: updatedNote, counts: snapshot.counts };
+}
+
+export function listBrainFindingNotes(root, { status, severity, command, filePath, label, limit = 50 } = {}) {
+  let notes = loadNotes(root).filter((note) => note.kind === 'helper-mcp-brain-finding' || note.findingId);
+  if (status) {
+    const wanted = String(status).trim().toLowerCase();
+    notes = notes.filter((note) => String(note.status || '').toLowerCase() === wanted);
+  }
+  if (severity) {
+    const wanted = String(severity).trim().toLowerCase();
+    notes = notes.filter((note) => String(note.findingSeverity || '').toLowerCase() === wanted);
+  }
+  if (command) {
+    const wanted = String(command).trim().toLowerCase();
+    notes = notes.filter((note) => String(note.sourceCommand || '').toLowerCase() === wanted);
+  }
+  if (filePath) {
+    const wanted = String(filePath).trim();
+    notes = notes.filter((note) => String(note.sourcePath || '').includes(wanted));
+  }
+  if (label) {
+    const wanted = String(label).trim().toLowerCase();
+    notes = notes.filter((note) => String(note.findingLabel || '').toLowerCase() === wanted);
+  }
+  return notes
+    .sort((a, b) => String(b.updatedAt || '').localeCompare(String(a.updatedAt || '')))
+    .slice(0, Math.max(1, Number(limit) || 50));
 }
 
 function saveBrainGraphNotes(root, notes) {
@@ -412,6 +541,185 @@ export function brainHistory(root, { noteId = '', limit = 100 } = {}) {
       note: entry.note || entry.after || entry.before || null,
       tagsAdded: entry.tagsAdded || [],
     })),
+  };
+}
+
+function scoreFindingNote(note, query = '') {
+  const needle = normalizeText(query);
+  if (!needle) return 0;
+  const haystack = normalizeText([
+    note.title,
+    note.summary,
+    note.evidence,
+    note.findingLabel,
+    note.sourceCommand,
+    note.sourcePath,
+    ...(Array.isArray(note.tags) ? note.tags : []),
+  ].join(' '));
+  let score = 0;
+  for (const token of needle.split(/\s+/).filter(Boolean)) {
+    if (haystack.includes(token)) score += 2;
+  }
+  if (normalizeText(note.title).includes(needle)) score += 4;
+  if (normalizeText(note.summary).includes(needle)) score += 3;
+  return score;
+}
+
+export function queryBrainFindingNotes(root, {
+  query = '',
+  severity,
+  status,
+  command,
+  filePath,
+  label,
+  limit = 50,
+} = {}) {
+  let notes = listBrainFindingNotes(root, { severity, status, command, filePath, label, limit: Math.max(1, Number(limit) || 50) });
+  const scored = notes.map((note) => ({
+    ...note,
+    score: scoreFindingNote(note, query),
+  })).filter((note) => note.score > 0 || !String(query || '').trim());
+  return {
+    query,
+    total: scored.length,
+    notes: scored
+      .sort((a, b) => b.score - a.score || String(b.updatedAt || '').localeCompare(String(a.updatedAt || '')))
+      .slice(0, Math.max(1, Number(limit) || 50)),
+  };
+}
+
+export function brainFindingHistory(root, { noteId = '', filePath = '', command = '', severity = '', limit = 100 } = {}) {
+  const events = loadBrainHistoryEntries(root)
+    .filter((entry) => entry.kind === 'helper-mcp-brain-finding-event' || entry.action?.startsWith('bridge_'))
+    .filter((entry) => !noteId || entry.findingId === noteId || entry.noteId === noteId || entry.after?.id === noteId || entry.before?.id === noteId)
+    .filter((entry) => !filePath || entry.after?.sourcePath === filePath || entry.before?.sourcePath === filePath || entry.note?.sourcePath === filePath)
+    .filter((entry) => !command || entry.sourceCommand === command || entry.after?.sourceCommand === command || entry.before?.sourceCommand === command)
+    .filter((entry) => !severity || String(entry.after?.findingSeverity || entry.before?.findingSeverity || '').toLowerCase() === String(severity).toLowerCase())
+    .sort((a, b) => String(b.generatedAt || '').localeCompare(String(a.generatedAt || '')));
+
+  return {
+    total: events.length,
+    events: events.slice(0, Math.max(1, Number(limit) || 100)).map((entry) => ({
+      generatedAt: entry.generatedAt,
+      action: entry.action,
+      findingId: entry.findingId || entry.noteId || entry.after?.id || entry.before?.id || '',
+      sourceCommand: entry.sourceCommand || entry.after?.sourceCommand || entry.before?.sourceCommand || '',
+      filePath: entry.after?.sourcePath || entry.before?.sourcePath || entry.note?.sourcePath || '',
+      severity: entry.after?.findingSeverity || entry.before?.findingSeverity || entry.note?.findingSeverity || '',
+      label: entry.after?.findingLabel || entry.before?.findingLabel || entry.note?.findingLabel || '',
+      status: entry.after?.status || entry.before?.status || entry.note?.status || '',
+      note: entry.after || entry.note || entry.before || null,
+    })),
+  };
+}
+
+export function buildBrainFindingGraph(root, { limit = 100 } = {}) {
+  const findingNotes = listBrainFindingNotes(root, { limit: Math.max(1, Number(limit) || 100) });
+  const regularNotes = loadNotes(root);
+  const nodes = new Map();
+  const edges = [];
+
+  for (const note of findingNotes) {
+    nodes.set(note.id, {
+      id: note.id,
+      kind: 'finding',
+      title: note.title,
+      status: note.status,
+      severity: note.findingSeverity,
+      sourceCommand: note.sourceCommand,
+      sourcePath: note.sourcePath,
+      label: note.findingLabel,
+    });
+  }
+
+  for (const note of regularNotes) {
+    if (!note.sourcePath) continue;
+    if (!findingNotes.some((finding) => finding.sourcePath === note.sourcePath)) continue;
+    nodes.set(note.id, {
+      id: note.id,
+      kind: 'note',
+      title: note.title,
+      status: note.status,
+      sourcePath: note.sourcePath,
+    });
+  }
+
+  const allNotes = [...findingNotes, ...regularNotes.filter((note) => note.sourcePath && findingNotes.some((finding) => finding.sourcePath === note.sourcePath))];
+  for (let i = 0; i < allNotes.length; i += 1) {
+    for (let j = i + 1; j < allNotes.length; j += 1) {
+      const left = allNotes[i];
+      const right = allNotes[j];
+      if (left.id === right.id) continue;
+      if (left.sourcePath && right.sourcePath && left.sourcePath === right.sourcePath) {
+        edges.push({ from: left.id, to: right.id, relation: 'same-source', weight: 1 });
+      }
+      if (left.findingLabel && right.findingLabel && left.findingLabel === right.findingLabel) {
+        edges.push({ from: left.id, to: right.id, relation: 'same-label', weight: 1 });
+      }
+      if (left.sourceCommand && right.sourceCommand && left.sourceCommand === right.sourceCommand) {
+        edges.push({ from: left.id, to: right.id, relation: 'same-command', weight: 1 });
+      }
+      for (const link of Array.isArray(left.links) ? left.links : []) {
+        if (link?.id === right.id) {
+          edges.push({ from: left.id, to: right.id, relation: link.relation || 'linked', weight: 1 });
+        }
+      }
+    }
+  }
+
+  return {
+    summary: {
+      totalNodes: nodes.size,
+      totalEdges: edges.length,
+      findingNodes: findingNotes.length,
+      regularNodes: nodes.size - findingNotes.length,
+    },
+    nodes: [...nodes.values()],
+    edges,
+  };
+}
+
+export function pruneBrainFindingNotes(root, { apply = false, limit = 10, threshold = 0.7 } = {}) {
+  const notes = listBrainFindingNotes(root, { limit: Math.max(1, Number(limit) || 10) });
+  const buckets = new Map();
+  for (const note of notes) {
+    const key = [note.sourceCommand, note.sourcePath, note.findingLabel].map((part) => normalizeText(part)).join('|');
+    if (!buckets.has(key)) buckets.set(key, []);
+    buckets.get(key).push(note);
+  }
+
+  const suggestions = [];
+  const removedIds = [];
+  for (const group of buckets.values()) {
+    if (group.length < 2) continue;
+    const sorted = group.slice().sort((a, b) => String(b.updatedAt || '').localeCompare(String(a.updatedAt || '')));
+    const keep = sorted[0];
+    const drop = sorted.slice(1);
+    suggestions.push({
+      keepId: keep.id,
+      keepTitle: keep.title,
+      dropIds: drop.map((note) => note.id),
+      sourcePath: keep.sourcePath,
+      findingLabel: keep.findingLabel,
+      score: 1,
+    });
+    removedIds.push(...drop.map((note) => note.id));
+  }
+
+  if (apply && removedIds.length > 0) {
+    const remaining = loadNotes(root).filter((note) => !removedIds.includes(note.id));
+    rebuildNotesFile(root, remaining);
+    rebuildCurrentSnapshot(root, remaining);
+    appendBrainFindingHistory(root, { action: 'finding_prune', removedIds, keptIds: suggestions.map((entry) => entry.keepId), threshold });
+  }
+
+  return {
+    ok: true,
+    total: suggestions.length,
+    suggestions,
+    removedIds,
+    threshold,
+    applied: apply && removedIds.length > 0,
   };
 }
 

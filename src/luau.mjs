@@ -3,6 +3,7 @@ import path from 'node:path';
 import crypto from 'node:crypto';
 import { readText, relative, toPosix, walkFiles, writeText } from './fs.mjs';
 import { loadLuauPatterns, defaultLuauPatterns } from './patterns.mjs';
+import { deriveFindingNoteId, upsertBrainFindingNote } from './brain.mjs';
 
 const LUAU_EXTENSIONS = new Set(['.lua', '.luau']);
 
@@ -132,6 +133,382 @@ function averageConfidence(items) {
   const values = (items || []).map((item) => Number(item?.confidence ?? item?.confidenceAverage ?? 0)).filter((value) => Number.isFinite(value));
   if (values.length === 0) return 0;
   return Number((values.reduce((sum, value) => sum + value, 0) / values.length).toFixed(2));
+}
+
+function normalizeFindingSeverity(severity) {
+  const value = String(severity || 'review').trim().toLowerCase();
+  if (value === 'critical' || value === 'high') return 'high';
+  if (value === 'warning' || value === 'medium' || value === 'review') return 'review';
+  return 'info';
+}
+
+function isLuauBridgeableCommand(commandName) {
+  return /luau\.(findings|flow|handlers|modulegraph|complexity|taint|security_scan|risk_score|repair|diff_context|dependencies|remotes|surface|decompile|metrics|changelog|migration|compare|inspect|scan)/.test(String(commandName || ''));
+}
+
+export function normalizeLuauFinding(commandName, finding = {}, context = {}) {
+  const filePath = toPosix(finding.filePath || context.filePath || context.sourcePath || '');
+  const line = Number(finding.line ?? context.line ?? 0) || 0;
+  const label = String(finding.label || finding.kind || finding.type || 'finding').trim() || 'finding';
+  const severity = normalizeFindingSeverity(finding.severity || context.severity || 'review');
+  const confidence = Number((Number(finding.confidence ?? context.confidence ?? (severity === 'high' ? 0.96 : severity === 'review' ? 0.78 : 0.62)) || 0).toFixed(2));
+  const evidence = String(finding.evidence || finding.text || finding.summary || '').trim();
+  const suggestedFix = String(finding.suggestedFix || finding.after || finding.repair || '').trim();
+  const bridgeable = finding.bridgeable !== false && (severity !== 'info' || context.bridgeInfo === true || isLuauBridgeableCommand(commandName));
+  const brainNoteId = deriveFindingNoteId({
+    command: commandName,
+    filePath,
+    line,
+    label,
+    evidence,
+  });
+
+  return {
+    command: commandName,
+    filePath,
+    line,
+    label,
+    severity,
+    confidence,
+    evidence,
+    suggestedFix,
+    bridgeable,
+    brainNoteId,
+    title: String(finding.title || `${label} @ ${filePath || 'workspace'}:${line || 0}`).trim(),
+    summary: String(finding.summary || evidence || suggestedFix || '').trim(),
+    tags: Array.isArray(finding.tags) ? finding.tags.map((tag) => String(tag).trim()).filter(Boolean) : [],
+    raw: finding,
+  };
+}
+
+export function collectLuauFindings(commandName, report, context = {}) {
+  const findings = [];
+  const sourcePath = String(context.filePath || context.sourcePath || report?.summary?.filePath || '').trim();
+
+  const pushMany = (items, base = {}) => {
+    for (const item of items || []) {
+      findings.push(normalizeLuauFinding(commandName, item, { ...context, ...base, filePath: item?.filePath || base.filePath || sourcePath }));
+    }
+  };
+
+  if (Array.isArray(report?.findings)) {
+    pushMany(report.findings, { filePath: sourcePath });
+  }
+
+  if (Array.isArray(report?.files) && !Array.isArray(report?.findings)) {
+    for (const entry of report.files) {
+      findings.push(...collectLuauFindings(commandName, entry, { ...context, filePath: entry.filePath || sourcePath, bridgeInfo: true }));
+    }
+  }
+
+  if (report?.dependencies && typeof report.dependencies === 'object') {
+    findings.push(...collectLuauFindings(commandName, report.dependencies, { ...context, filePath: sourcePath, bridgeInfo: true }));
+  }
+
+  if (report?.categories) {
+    for (const [category, items] of Object.entries(report.categories)) {
+      pushMany(items.map((item) => ({
+        ...item,
+        label: item.label || category,
+        title: item.title || `${category} finding`,
+        summary: item.text || item.summary || '',
+        evidence: item.text || item.evidence || '',
+      })), { filePath: sourcePath });
+    }
+  }
+
+  if (Array.isArray(report?.sources)) {
+    pushMany(report.sources.map((item) => ({
+      ...item,
+      label: item.label || 'taint-source',
+      summary: item.text || 'taint source',
+      evidence: item.text || '',
+      severity: item.severity || 'high',
+    })), { filePath: sourcePath, bridgeInfo: true });
+  }
+
+  if (Array.isArray(report?.sinks)) {
+    pushMany(report.sinks.map((item) => ({
+      ...item,
+      label: item.label || 'taint-sink',
+      summary: item.text || 'taint sink',
+      evidence: item.text || '',
+      severity: item.severity || 'high',
+    })), { filePath: sourcePath, bridgeInfo: true });
+  }
+
+  if (Array.isArray(report?.flows)) {
+    pushMany(report.flows.map((item) => ({
+      ...item,
+      filePath: sourcePath,
+      label: item.label || 'taint-flow',
+      summary: `${item.variable || 'value'} flow from L${item.sourceLine || 0} to L${item.sinkLine || 0}`,
+      evidence: `${item.variable || 'value'} flow from L${item.sourceLine || 0} to L${item.sinkLine || 0}`,
+      severity: item.severity || 'review',
+    })), { filePath: sourcePath, bridgeInfo: true });
+  }
+
+  if (Array.isArray(report?.functions)) {
+    pushMany(report.functions.map((item) => ({
+      ...item,
+      filePath: sourcePath,
+      label: item.label || 'complexity',
+      summary: `complexity ${item.complexity || 0} in ${item.name || 'function'}`,
+      evidence: item.text || item.name || '',
+      severity: (item.complexity || 0) >= 8 ? 'high' : 'review',
+    })), { filePath: sourcePath, bridgeInfo: true });
+  }
+
+  if (Array.isArray(report?.scripts)) {
+    pushMany(report.scripts.flatMap((script) => [
+      ...(Array.isArray(script.unusedImports) ? script.unusedImports.map((alias) => ({
+        filePath: script.path,
+        line: 0,
+        label: 'unused-import',
+        title: `${alias} unused in ${script.path}`,
+        summary: `${alias} is only referenced once in ${script.path}`,
+        evidence: alias,
+        severity: 'review',
+      })) : []),
+      ...(script.requires?.length === 0 ? [{
+        filePath: script.path,
+        line: 0,
+        label: 'orphaned-script',
+        title: `No require() calls in ${script.path}`,
+        summary: `${script.path} does not require any modules`,
+        evidence: script.path,
+        severity: 'info',
+      }] : []),
+    ]), { bridgeInfo: true });
+  }
+
+  if (Array.isArray(report?.remotes)) {
+    pushMany(report.remotes.flatMap((remote) => [
+      ...(remote.orphaned ? [{
+        filePath: (remote.files && remote.files[0]) || sourcePath,
+        line: remote.uses?.[0]?.line || 0,
+        label: 'orphaned-remote',
+        title: `${remote.name} has no handlers`,
+        summary: `${remote.name} is used but lacks a matching handler`,
+        evidence: remote.name,
+        severity: 'review',
+      }] : []),
+      ...((!remote.hasServerHandler || !remote.hasClientHandler) ? [{
+        filePath: (remote.files && remote.files[0]) || sourcePath,
+        line: remote.handlers?.[0]?.line || remote.uses?.[0]?.line || 0,
+        label: 'remote-handler-gap',
+        title: `${remote.name} missing handler coverage`,
+        summary: `${remote.name} is missing ${remote.hasServerHandler ? 'client' : 'server'} coverage`,
+        evidence: remote.name,
+        severity: 'info',
+      }] : []),
+    ]), { bridgeInfo: true });
+  }
+
+  if (Array.isArray(report?.hunks)) {
+    pushMany(report.hunks.map((item) => ({
+      ...item,
+      filePath: sourcePath,
+      label: item.type || 'diff-hunk',
+      title: `${item.type} line ${item.line}`,
+      summary: item.after || item.before || '',
+      evidence: item.after || item.before || '',
+      severity: item.type === 'added' ? 'info' : 'review',
+    })), { bridgeInfo: true });
+  }
+
+  if (Array.isArray(report?.matches)) {
+    pushMany(report.matches.map((item) => ({
+      ...item,
+      filePath: item.file || sourcePath,
+      label: 'pattern-match',
+      title: `Pattern match in ${item.file || sourcePath}`,
+      summary: item.text || '',
+      evidence: item.text || '',
+      severity: 'info',
+    })), { bridgeInfo: true });
+  }
+
+  if (Array.isArray(report?.added)) {
+    pushMany(report.added.map((item) => ({
+      filePath: sourcePath,
+      line: item?.line || 0,
+      label: 'added-finding',
+      title: typeof item === 'string' ? item : `${item?.name || 'item'} added`,
+      summary: typeof item === 'string' ? item : `${item?.name || 'item'} added`,
+      evidence: typeof item === 'string' ? item : JSON.stringify(item),
+      severity: 'info',
+    })), { bridgeInfo: true });
+  }
+
+  if (Array.isArray(report?.missing)) {
+    pushMany(report.missing.map((item) => ({
+      filePath: sourcePath,
+      line: item?.line || 0,
+      label: 'missing-finding',
+      title: typeof item === 'string' ? item : `${item?.name || 'item'} removed`,
+      summary: typeof item === 'string' ? item : `${item?.name || 'item'} removed`,
+      evidence: typeof item === 'string' ? item : JSON.stringify(item),
+      severity: 'review',
+    })), { bridgeInfo: true });
+  }
+
+  if (report?.structural && typeof report.structural === 'object') {
+    const structural = report.structural;
+    if (structural.functions && typeof structural.functions === 'object') {
+      pushMany([
+        ...(Array.isArray(structural.functions.added) ? structural.functions.added.map((item) => ({
+          filePath: sourcePath,
+          line: item.line || 0,
+          label: 'function-added',
+          title: `Function added: ${item.name || 'unknown'}`,
+          summary: `Function added: ${item.name || 'unknown'}`,
+          evidence: item.name || '',
+          severity: 'info',
+        })) : []),
+        ...(Array.isArray(structural.functions.removed) ? structural.functions.removed.map((item) => ({
+          filePath: sourcePath,
+          line: item.line || 0,
+          label: 'function-removed',
+          title: `Function removed: ${item.name || 'unknown'}`,
+          summary: `Function removed: ${item.name || 'unknown'}`,
+          evidence: item.name || '',
+          severity: 'review',
+        })) : []),
+      ], { bridgeInfo: true });
+    }
+  }
+
+  if (Array.isArray(report?.duplicates)) {
+    pushMany(report.duplicates.map((item) => ({
+      ...item,
+      filePath: sourcePath,
+      label: 'duplicate-flag',
+      title: `${item.name || 'flag'} duplicated`,
+      summary: `${item.name || 'flag'} appears ${item.count || 0} times`,
+      evidence: `${item.name || 'flag'} appears ${item.count || 0} times`,
+      severity: 'high',
+    })), { bridgeInfo: true });
+  }
+
+  if (Array.isArray(report?.orphanedDefined)) {
+    pushMany(report.orphanedDefined.map((item) => ({
+      ...item,
+      filePath: sourcePath,
+      label: 'orphaned-flag',
+      title: `${item.name || 'flag'} defined but never read`,
+      summary: `${item.name || 'flag'} is never read`,
+      evidence: item.name || '',
+      severity: 'review',
+    })), { bridgeInfo: true });
+  }
+
+  if (Array.isArray(report?.edges)) {
+    pushMany(report.edges.map((item) => ({
+      ...item,
+      filePath: sourcePath,
+      label: item.kind || 'graph-edge',
+      title: `${item.kind || 'edge'} ${item.from || '?'} -> ${item.to || '?'}`,
+      summary: `${item.from || '?'} -> ${item.to || '?'}`,
+      evidence: `${item.from || '?'} -> ${item.to || '?'}`,
+      severity: item.kind === 'remote-call' ? 'review' : 'info',
+    })), { bridgeInfo: true });
+  }
+
+  if (Array.isArray(report?.modules)) {
+    pushMany(report.modules.flatMap((module) => [
+      ...(Array.isArray(module.unusedImports) ? module.unusedImports.map((alias) => ({
+        filePath: module.path,
+        line: 0,
+        label: 'unused-import',
+        title: `${alias} unused in ${module.path}`,
+        summary: `${alias} is only referenced once in ${module.path}`,
+        evidence: alias,
+        severity: 'review',
+      })) : []),
+      ...(Array.isArray(module.requires) ? module.requires.map((entry) => ({
+        filePath: module.path,
+        line: entry.line || 0,
+        label: 'module-edge',
+        title: `${module.path} requires ${entry.target}`,
+        summary: `${module.path} requires ${entry.target}`,
+        evidence: entry.text || `${module.path} requires ${entry.target}`,
+        severity: 'info',
+      })) : []),
+    ]), { bridgeInfo: true });
+  }
+
+  return findings.map((finding) => ({
+    ...finding,
+    sourceCommand: commandName,
+  }));
+}
+
+export function bridgeLuauCommandResult(root, commandName, report, context = {}) {
+  const findings = collectLuauFindings(commandName, report, context);
+  const brainNoteIds = [];
+  for (const finding of findings) {
+    if (!finding.bridgeable) continue;
+    const note = upsertBrainFindingNote(root, finding);
+    if (note?.note?.id) {
+      brainNoteIds.push(note.note.id);
+    }
+  }
+  const uniqueBrainNoteIds = [...new Set(brainNoteIds)];
+  return {
+    ...report,
+    findings: Array.isArray(report?.findings) ? report.findings : findings,
+    brainNoteIds: uniqueBrainNoteIds,
+    bridge: {
+      totalFindings: findings.length,
+      bridgedFindings: uniqueBrainNoteIds.length,
+    },
+  };
+}
+
+export function summarizeLuauFindings(findings) {
+  const total = (findings || []).length;
+  return {
+    totalFindings: total,
+    bridgeableCount: (findings || []).filter((finding) => finding.bridgeable).length,
+    highCount: (findings || []).filter((finding) => finding.severity === 'high').length,
+    reviewCount: (findings || []).filter((finding) => finding.severity === 'review').length,
+    infoCount: (findings || []).filter((finding) => finding.severity === 'info').length,
+    confidenceAverage: averageConfidence(findings),
+  };
+}
+
+export function buildLuauFindingsReport(root, { filePath = '', targetPath = '' } = {}) {
+  const patterns = loadLuauPatterns(root);
+  const findings = [];
+  const files = [];
+  const resolvedFile = filePath ? (path.isAbsolute(filePath) ? filePath : path.join(root, filePath)) : '';
+
+  if (resolvedFile) {
+    const analysis = analyzeLuauText(readText(resolvedFile), resolvedFile, patterns);
+    const normalized = collectLuauFindings('luau.findings', analysis, { filePath: toPosix(relative(root, resolvedFile)), bridgeInfo: true });
+    findings.push(...normalized);
+    files.push({ filePath: toPosix(relative(root, resolvedFile)), findingCount: normalized.length });
+  } else {
+    const scan = scanLuauWorkspace(root);
+    const selectedFiles = resolveLuauFiles(root, targetPath);
+    const selectedPaths = new Set(selectedFiles.map((item) => toPosix(relative(root, item))));
+    for (const entry of scan.files) {
+      if (selectedPaths.size > 0 && !selectedPaths.has(entry.filePath)) continue;
+      const normalized = collectLuauFindings('luau.findings', entry, { filePath: entry.filePath, bridgeInfo: true });
+      findings.push(...normalized);
+      files.push({ filePath: entry.filePath, findingCount: normalized.length });
+    }
+  }
+
+  return {
+    summary: {
+      ...summarizeLuauFindings(findings),
+      fileCount: files.length,
+    },
+    files,
+    findings,
+  };
 }
 
 function resolveLuauFiles(root, targetPath = '') {

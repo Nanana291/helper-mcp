@@ -4,6 +4,7 @@ import {
   buildBrainSnapshot,
   buildBrainGraph,
   brainHistory,
+  brainFindingHistory,
   diffBrainSnapshot,
   archiveBrainNote,
   deleteBrainNote,
@@ -12,6 +13,9 @@ import {
   listBrainNotes,
   loadBrainSnapshot,
   mergeBrainNotes,
+  buildBrainFindingGraph,
+  pruneBrainFindingNotes,
+  queryBrainFindingNotes,
   pruneDuplicateBrainNotes,
   promoteBrainNote,
   queryBrainAdvanced,
@@ -26,6 +30,7 @@ import {
   analyzeLuauText,
   analyzeLuauFlow,
   analyzeLuauTaint,
+  buildLuauFindingsReport,
   buildLuauDependencyMap,
   buildLuauMigrationChangelog,
   buildLuauModuleGraph,
@@ -51,6 +56,7 @@ import {
   suggestLuauRefactor,
   scanLuauSecurity,
   scanLuauWorkspace,
+  bridgeLuauCommandResult,
   writeLuauHotfixSnapshots,
 } from './luau.mjs';
 import { buildConfigValidationMarkdown, saveConfigValidation, validateConfigFile } from './config.mjs';
@@ -67,7 +73,7 @@ import {
 import { readText, toPosix, writeText } from './fs.mjs';
 
 export const serverName = 'helper-mcp';
-export const serverVersion = '0.6.1';
+export const serverVersion = '0.6.2';
 
 function jsonText(value) {
   return JSON.stringify(value, null, 2);
@@ -75,6 +81,10 @@ function jsonText(value) {
 
 function textResult(text) {
   return { content: [{ type: 'text', text }] };
+}
+
+function bridgeLuauTextResult(workspaceRoot, commandName, report, context = {}) {
+  return textResult(jsonText(bridgeLuauCommandResult(workspaceRoot, commandName, report, context)));
 }
 
 function resourceResult(uri, text, mimeType = 'text/plain') {
@@ -194,7 +204,9 @@ function toolAnnotations(canonicalName) {
     'healthcheck',
     'workspace.summary', 'workspace.risks', 'workspace.coverage', 'workspace.audit', 'workspace.diff', 'workspace.validate', 'workspace.release_notes',
     'brain.search', 'brain.snapshot', 'brain.list', 'brain.export', 'brain.history', 'brain.graph', 'brain.query_advanced', 'brain.diff', 'brain.restore_diff',
-    'luau.scan', 'luau.inspect', 'luau.compare', 'luau.diff', 'luau.pattern',
+    'brain.findings', 'brain.finding_history', 'brain.finding_graph',
+    'brain.findings', 'brain.finding_history', 'brain.finding_graph', 'brain.finding_prune',
+    'luau.scan', 'luau.inspect', 'luau.compare', 'luau.diff', 'luau.pattern', 'luau.findings',
     'luau.flags', 'luau.ui_map', 'luau.migration',
     'luau.decompile', 'luau.security_scan', 'luau.performance_profile', 'luau.dependencies', 'luau.remotes', 'luau.complexity',
     'luau.taint', 'luau.flow', 'luau.handlers', 'luau.surface', 'luau.refactor', 'luau.modulegraph', 'luau.risk_score', 'luau.diff_context',
@@ -409,6 +421,66 @@ const toolDefinitions = [
     },
   },
   {
+    canonicalName: 'brain.findings',
+    aliases: ['brain.findings', 'brain_findings'],
+    description: 'Query brain notes derived from Luau findings.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        query: { type: 'string' },
+        severity: { type: 'string' },
+        status: { type: 'string' },
+        command: { type: 'string' },
+        filePath: { type: 'string' },
+        label: { type: 'string' },
+        limit: { type: 'number' },
+      },
+      additionalProperties: false,
+    },
+  },
+  {
+    canonicalName: 'brain.finding_history',
+    aliases: ['brain.finding_history', 'brain_finding_history'],
+    description: 'Show temporal history for finding-derived brain notes.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        noteId: { type: 'string' },
+        filePath: { type: 'string' },
+        command: { type: 'string' },
+        severity: { type: 'string' },
+        limit: { type: 'number' },
+      },
+      additionalProperties: false,
+    },
+  },
+  {
+    canonicalName: 'brain.finding_graph',
+    aliases: ['brain.finding_graph', 'brain_finding_graph'],
+    description: 'Graph finding-derived notes alongside related regular notes.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        limit: { type: 'number' },
+      },
+      additionalProperties: false,
+    },
+  },
+  {
+    canonicalName: 'brain.finding_prune',
+    aliases: ['brain.finding_prune', 'brain_finding_prune'],
+    description: 'Conservatively find or consolidate duplicate finding-derived notes.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        apply: { type: 'boolean' },
+        limit: { type: 'number' },
+        threshold: { type: 'number' },
+      },
+      additionalProperties: false,
+    },
+  },
+  {
     canonicalName: 'brain.link',
     aliases: ['brain.link', 'brain_link'],
     description: 'Create explicit relationships between two brain notes.',
@@ -594,6 +666,32 @@ const toolDefinitions = [
         newPath: { type: 'string', description: 'Path to the new (after) file.' },
       },
       required: ['oldPath', 'newPath'],
+      additionalProperties: false,
+    },
+  },
+  {
+    canonicalName: 'luau.findings',
+    aliases: ['luau.findings', 'luau_findings'],
+    description: 'Return normalized Luau findings that can be bridged into brain notes.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        filePath: { type: 'string' },
+        targetPath: { type: 'string' },
+      },
+      additionalProperties: false,
+    },
+  },
+  {
+    canonicalName: 'luau.brain_sync',
+    aliases: ['luau.brain_sync', 'luau_brain_sync'],
+    description: 'Force a bridge pass that writes Luau findings into brain notes.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        filePath: { type: 'string' },
+        targetPath: { type: 'string' },
+      },
       additionalProperties: false,
     },
   },
@@ -1067,6 +1165,40 @@ export function handleTool(workspaceRoot, requestedName, args = {}) {
       })));
     }
 
+    case 'brain.findings': {
+      return textResult(jsonText(queryBrainFindingNotes(workspaceRoot, {
+        query: args.query || '',
+        severity: args.severity,
+        status: args.status,
+        command: args.command,
+        filePath: args.filePath,
+        label: args.label,
+        limit: args.limit,
+      })));
+    }
+
+    case 'brain.finding_history': {
+      return textResult(jsonText(brainFindingHistory(workspaceRoot, {
+        noteId: args.noteId,
+        filePath: args.filePath,
+        command: args.command,
+        severity: args.severity,
+        limit: args.limit,
+      })));
+    }
+
+    case 'brain.finding_graph': {
+      return textResult(jsonText(buildBrainFindingGraph(workspaceRoot, { limit: args.limit })));
+    }
+
+    case 'brain.finding_prune': {
+      return textResult(jsonText(pruneBrainFindingNotes(workspaceRoot, {
+        apply: args.apply === true,
+        limit: args.limit,
+        threshold: args.threshold,
+      })));
+    }
+
     case 'brain.link': {
       return textResult(jsonText(linkBrainNotes(workspaceRoot, args.fromId, args.toId, args.relation)));
     }
@@ -1090,34 +1222,43 @@ export function handleTool(workspaceRoot, requestedName, args = {}) {
       })));
     }
 
-    case 'luau.scan': return textResult(jsonText(scanLuauWorkspace(workspaceRoot)));
+    case 'luau.scan': return bridgeLuauTextResult(workspaceRoot, 'luau.scan', scanLuauWorkspace(workspaceRoot));
 
     case 'luau.inspect': {
       const filePath = String(args.filePath || '').trim();
       const resolved = filePath ? (path.isAbsolute(filePath) ? filePath : path.resolve(workspaceRoot, filePath)) : '';
-      return textResult(formatLuauAnalysis(analyzeLuauText(readText(resolved), resolved)));
+      const analysis = analyzeLuauText(readText(resolved), resolved);
+      const bridged = bridgeLuauCommandResult(workspaceRoot, 'luau.inspect', analysis, { filePath: resolved });
+      const bridgeLines = bridged.brainNoteIds.length > 0
+        ? [`## Brain Bridge`, `- note ids: ${bridged.brainNoteIds.join(', ')}`]
+        : ['## Brain Bridge', '- no bridgeable findings'];
+      return textResult(`${formatLuauAnalysis(analysis)}\n${bridgeLines.join('\n')}\n`);
     }
 
-    case 'luau.compare': return textResult(jsonText(compareLuauFiles(workspaceRoot, args.filePath, args.baselinePath)));
+    case 'luau.compare': return bridgeLuauTextResult(workspaceRoot, 'luau.compare', compareLuauFiles(workspaceRoot, args.filePath, args.baselinePath), {
+      filePath: args.filePath || '',
+    });
 
-    case 'luau.diff': return textResult(jsonText(diffLuauFiles(workspaceRoot, args.pathA, args.pathB)));
+    case 'luau.diff': return bridgeLuauTextResult(workspaceRoot, 'luau.diff', diffLuauFiles(workspaceRoot, args.pathA, args.pathB), {
+      filePath: args.pathA || '',
+    });
 
     case 'luau.pattern': {
-      return textResult(jsonText(patternSearchLuau(workspaceRoot, args.pattern, {
+      return bridgeLuauTextResult(workspaceRoot, 'luau.pattern', patternSearchLuau(workspaceRoot, args.pattern, {
         maxResults: args.maxResults, context: args.context, fileFilter: args.fileFilter,
-      })));
+      }), { bridgeInfo: true });
     }
 
     case 'luau.flags': {
       const filePath = String(args.filePath || '').trim();
       const resolved = filePath ? (path.isAbsolute(filePath) ? filePath : path.resolve(workspaceRoot, filePath)) : '';
-      return textResult(jsonText(extractFlagsFromText(readText(resolved), resolved)));
+      return bridgeLuauTextResult(workspaceRoot, 'luau.flags', extractFlagsFromText(readText(resolved), resolved), { filePath: resolved });
     }
 
     case 'luau.ui_map': {
       const filePath = String(args.filePath || '').trim();
       const resolved = filePath ? (path.isAbsolute(filePath) ? filePath : path.resolve(workspaceRoot, filePath)) : '';
-      return textResult(jsonText(extractUIMap(readText(resolved), resolved)));
+      return bridgeLuauTextResult(workspaceRoot, 'luau.ui_map', extractUIMap(readText(resolved), resolved), { filePath: resolved });
     }
 
     case 'luau.migration': {
@@ -1126,40 +1267,78 @@ export function handleTool(workspaceRoot, requestedName, args = {}) {
       return textResult(jsonText({ ...result, brainNote: note }));
     }
 
+    case 'luau.findings': {
+      return bridgeLuauTextResult(workspaceRoot, 'luau.findings', buildLuauFindingsReport(workspaceRoot, {
+        filePath: args.filePath || '',
+        targetPath: args.targetPath || '',
+      }), {
+        filePath: args.filePath || args.targetPath || '',
+        bridgeInfo: true,
+      });
+    }
+
+    case 'luau.brain_sync': {
+      return bridgeLuauTextResult(workspaceRoot, 'luau.brain_sync', buildLuauFindingsReport(workspaceRoot, {
+        filePath: args.filePath || '',
+        targetPath: args.targetPath || '',
+      }), {
+        filePath: args.filePath || args.targetPath || '',
+        bridgeInfo: true,
+      });
+    }
+
     case 'luau.taint': {
       const resolved = resolveFilePath(workspaceRoot, args.filePath);
-      return textResult(jsonText(analyzeLuauTaint(readText(resolved), resolved)));
+      return bridgeLuauTextResult(workspaceRoot, 'luau.taint', analyzeLuauTaint(readText(resolved), resolved), { filePath: resolved });
     }
 
     case 'luau.flow': {
       const resolved = resolveFilePath(workspaceRoot, args.filePath);
-      return textResult(jsonText(analyzeLuauFlow(readText(resolved), resolved)));
+      return bridgeLuauTextResult(workspaceRoot, 'luau.flow', analyzeLuauFlow(readText(resolved), resolved), { filePath: resolved, bridgeInfo: true });
     }
 
     case 'luau.handlers': {
-      return textResult(jsonText(mapLuauHandlers(workspaceRoot, args.targetPath || '')));
+      return bridgeLuauTextResult(workspaceRoot, 'luau.handlers', mapLuauHandlers(workspaceRoot, args.targetPath || ''), {
+        filePath: args.targetPath || '',
+        bridgeInfo: true,
+      });
     }
 
     case 'luau.surface': {
-      return textResult(jsonText(summarizeLuauSurface(workspaceRoot, args.targetPath || '')));
+      return bridgeLuauTextResult(workspaceRoot, 'luau.surface', summarizeLuauSurface(workspaceRoot, args.targetPath || ''), {
+        filePath: args.targetPath || '',
+        bridgeInfo: true,
+      });
     }
 
     case 'luau.refactor': {
       const resolved = resolveFilePath(workspaceRoot, args.filePath);
-      return textResult(jsonText(suggestLuauRefactor(readText(resolved), resolved, args.riskLabel)));
+      return bridgeLuauTextResult(workspaceRoot, 'luau.refactor', suggestLuauRefactor(readText(resolved), resolved, args.riskLabel), {
+        filePath: resolved,
+        bridgeInfo: true,
+      });
     }
 
     case 'luau.modulegraph': {
-      return textResult(jsonText(buildLuauModuleGraph(workspaceRoot, args.targetPath || '')));
+      return bridgeLuauTextResult(workspaceRoot, 'luau.modulegraph', buildLuauModuleGraph(workspaceRoot, args.targetPath || ''), {
+        filePath: args.targetPath || '',
+        bridgeInfo: true,
+      });
     }
 
     case 'luau.risk_score': {
       const resolved = resolveFilePath(workspaceRoot, args.filePath);
-      return textResult(jsonText(scoreLuauRisk(readText(resolved), resolved)));
+      return bridgeLuauTextResult(workspaceRoot, 'luau.risk_score', scoreLuauRisk(readText(resolved), resolved), {
+        filePath: resolved,
+        bridgeInfo: true,
+      });
     }
 
     case 'luau.diff_context': {
-      return textResult(jsonText(diffLuauWithContext(workspaceRoot, args.pathA, args.pathB, { context: args.context })));
+      return bridgeLuauTextResult(workspaceRoot, 'luau.diff_context', diffLuauWithContext(workspaceRoot, args.pathA, args.pathB, { context: args.context }), {
+        filePath: args.pathA || '',
+        bridgeInfo: true,
+      });
     }
 
     case 'luau.note': {
@@ -1189,41 +1368,41 @@ export function handleTool(workspaceRoot, requestedName, args = {}) {
     case 'luau.decompile': {
       const resolved = resolveFilePath(workspaceRoot, args.filePath);
       const report = decompileLuauHeuristics(readText(resolved), resolved);
-      return textResult(jsonText(report));
+      return bridgeLuauTextResult(workspaceRoot, 'luau.decompile', report, { filePath: resolved, bridgeInfo: true });
     }
 
     case 'luau.repair': {
       const resolved = resolveFilePath(workspaceRoot, args.filePath);
       const report = repairLuauRisk(readText(resolved), resolved, args.riskLabel);
-      return textResult(jsonText(report));
+      return bridgeLuauTextResult(workspaceRoot, 'luau.repair', report, { filePath: resolved, bridgeInfo: true });
     }
 
     case 'luau.security_scan': {
       const resolved = resolveFilePath(workspaceRoot, args.filePath);
       const report = scanLuauSecurity(readText(resolved), resolved);
-      return textResult(jsonText(report));
+      return bridgeLuauTextResult(workspaceRoot, 'luau.security_scan', report, { filePath: resolved });
     }
 
     case 'luau.performance_profile': {
       const resolved = resolveFilePath(workspaceRoot, args.filePath);
       const report = profileLuauPerformance(readText(resolved), resolved);
-      return textResult(jsonText(report));
+      return bridgeLuauTextResult(workspaceRoot, 'luau.performance_profile', report, { filePath: resolved });
     }
 
     case 'luau.dependencies': {
       const report = buildLuauDependencyMap(workspaceRoot, args.targetPath || '');
-      return textResult(jsonText(report));
+      return bridgeLuauTextResult(workspaceRoot, 'luau.dependencies', report, { filePath: args.targetPath || '', bridgeInfo: true });
     }
 
     case 'luau.remotes': {
       const report = buildLuauRemoteGraph(workspaceRoot, args.targetPath || '');
-      return textResult(jsonText(report));
+      return bridgeLuauTextResult(workspaceRoot, 'luau.remotes', report, { filePath: args.targetPath || '', bridgeInfo: true });
     }
 
     case 'luau.complexity': {
       const resolved = resolveFilePath(workspaceRoot, args.filePath);
       const report = scoreLuauComplexity(readText(resolved), resolved);
-      return textResult(jsonText(report));
+      return bridgeLuauTextResult(workspaceRoot, 'luau.complexity', report, { filePath: resolved });
     }
 
     case 'luau.changelog': {
