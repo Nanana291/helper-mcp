@@ -62,16 +62,16 @@ claude mcp get helper-mcp
 
 ## Codex
 
-Start the HTTP server in one terminal:
+Start the tunnel in one terminal:
 
 ```bash
-node /absolute/path/to/helper-mcp/src/http.mjs
+npm run start:tunnel
 ```
 
 Add it to Codex as a streamable HTTP server:
 
 ```bash
-codex mcp add helper-mcp --url http://127.0.0.1:3333/mcp
+codex mcp add helper-mcp --url https://YOUR-TUNNEL.loca.lt/mcp
 ```
 
 Verify it was added:
@@ -101,3 +101,4 @@ qwen mcp list
 - The write tools only affect the local `.helper-mcp/` brain store.
 - If a client has trouble with dotted tool names, use the underscore alias with the same behavior.
 - For Codex, keep the HTTP server running while the session uses the MCP tools.
+- The Codex setup works best through the HTTPS tunnel printed by `npm run start:tunnel`.

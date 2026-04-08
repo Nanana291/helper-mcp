@@ -10,9 +10,11 @@
   "scripts": {
     "start": "node ./src/index.mjs",
     "start:http": "node ./src/http.mjs",
+    "start:tunnel": "node ./src/tunnel.mjs",
     "test": "node --test"
   },
   "dependencies": {
-    "@modelcontextprotocol/sdk": "^1.29.0"
+    "@modelcontextprotocol/sdk": "^1.29.0",
+    "localtunnel": "^2.0.2"
   }
 }
