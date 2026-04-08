@@ -34,6 +34,7 @@ test('helper-mcp http transport starts and exposes tools', async () => {
     const tools = await client.listTools();
     assert.ok(tools.tools.length >= 9);
     assert.ok(tools.tools.some((tool) => tool.name === 'healthcheck'));
+    assert.ok(tools.tools.some((tool) => tool.name === 'workspace_summary'));
   } finally {
     await client.close?.();
     await transport.close();

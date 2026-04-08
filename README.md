@@ -21,8 +21,10 @@ It is designed to help with tasks like:
 - `luau.compare`
 - `luau.note`
 
-Each canonical tool also ships with a compatibility alias that uses underscores instead of dots,
-for example `brain.snapshot` and `brain_snapshot`.
+The advertised tool names use underscore-friendly aliases for maximum client compatibility,
+for example `brain_snapshot` instead of `brain.snapshot`.
+
+The server still accepts the dotted canonical names internally, but it does not advertise them by default.
 
 The server also exposes read-only resources:
 

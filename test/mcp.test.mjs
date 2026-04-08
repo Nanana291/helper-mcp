@@ -26,10 +26,7 @@ test('helper-mcp exposes compatibility aliases and resources', async () => {
     const toolNames = tools.tools.map((tool) => tool.name);
 
     assert.ok(toolNames.includes('healthcheck'));
-    assert.ok(toolNames.includes('health_check'));
-    assert.ok(toolNames.includes('workspace.summary'));
     assert.ok(toolNames.includes('workspace_summary'));
-    assert.ok(toolNames.includes('brain.snapshot'));
     assert.ok(toolNames.includes('brain_snapshot'));
 
     const resources = await client.listResources();

@@ -171,13 +171,12 @@ export function getToolDefinitions() {
 export function getTools() {
   const tools = [];
   for (const definition of toolDefinitions) {
-    for (const alias of definition.aliases) {
-      tools.push({
-        name: alias,
-        description: definition.description,
-        inputSchema: definition.inputSchema,
-      });
-    }
+    const displayName = definition.aliases.find((alias) => !alias.includes('.')) || definition.canonicalName;
+    tools.push({
+      name: displayName,
+      description: definition.description,
+      inputSchema: definition.inputSchema,
+    });
   }
   return tools;
 }
