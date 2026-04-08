@@ -41,7 +41,8 @@ npm install
 ```
 
 The server runs from the repo root and stores its local brain in `.helper-mcp/`.
-The default transport is stdio, which works with Claude Code, Codex, and Qwen Code.
+The default transport is stdio, which works with Claude Code and Qwen Code.
+For Codex, there is also a local streamable HTTP transport that exposes the same tools and resources.
 
 ## Claude Code
 
@@ -59,10 +60,16 @@ claude mcp get helper-mcp
 
 ## Codex
 
-Add the server from the cloned path:
+Start the HTTP server in one terminal:
 
 ```bash
-codex mcp add helper-mcp -- node /absolute/path/to/helper-mcp/src/index.mjs
+node /absolute/path/to/helper-mcp/src/http.mjs
+```
+
+Add it to Codex as a streamable HTTP server:
+
+```bash
+codex mcp add helper-mcp --url http://127.0.0.1:3333/mcp
 ```
 
 Verify it was added:
@@ -91,3 +98,4 @@ qwen mcp list
 - Set `HELPER_MCP_ROOT` if you need the server to point at a different workspace root.
 - The write tools only affect the local `.helper-mcp/` brain store.
 - If a client has trouble with dotted tool names, use the underscore alias with the same behavior.
+- For Codex, keep the HTTP server running while the session uses the MCP tools.

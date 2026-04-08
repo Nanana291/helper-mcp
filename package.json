@@ -9,6 +9,7 @@
   },
   "scripts": {
     "start": "node ./src/index.mjs",
+    "start:http": "node ./src/http.mjs",
     "test": "node --test"
   },
   "dependencies": {
