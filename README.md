@@ -11,6 +11,7 @@ It is designed to help with tasks like:
 
 ## What it exposes
 
+- `healthcheck`
 - `workspace.summary`
 - `brain.add`
 - `brain.search`
@@ -20,7 +21,14 @@ It is designed to help with tasks like:
 - `luau.compare`
 - `luau.note`
 
-The default server surface is tool-only for maximum Codex compatibility.
+Each canonical tool also ships with a compatibility alias that uses underscores instead of dots,
+for example `brain.snapshot` and `brain_snapshot`.
+
+The server also exposes read-only resources:
+
+- `helper://workspace/summary`
+- `helper://brain/snapshot`
+- `helper://luau/scan`
 
 ## Install
 
@@ -33,6 +41,7 @@ npm install
 ```
 
 The server runs from the repo root and stores its local brain in `.helper-mcp/`.
+The default transport is stdio, which works with Claude Code, Codex, and Qwen Code.
 
 ## Claude Code
 
@@ -81,3 +90,4 @@ qwen mcp list
 - Use a trusted workspace. `helper-mcp` reads local files from the current project root.
 - Set `HELPER_MCP_ROOT` if you need the server to point at a different workspace root.
 - The write tools only affect the local `.helper-mcp/` brain store.
+- If a client has trouble with dotted tool names, use the underscore alias with the same behavior.

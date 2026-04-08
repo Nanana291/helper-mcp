@@ -34,7 +34,7 @@ function loadNotes(root) {
     .filter(Boolean);
 }
 
-function summarizeNotes(notes) {
+export function summarizeBrainNotes(notes) {
   const counts = {
     total: notes.length,
     byStatus: {},
@@ -54,15 +54,19 @@ function summarizeNotes(notes) {
   return counts;
 }
 
-function rebuildCurrentSnapshot(root, notes) {
-  const { current } = brainPaths(root);
-  const snapshot = {
+export function buildBrainSnapshot(root, notes = loadNotes(root)) {
+  return {
     kind: 'helper-mcp-brain',
     generatedAt: new Date().toISOString(),
     workspaceRoot: root,
-    counts: summarizeNotes(notes),
+    counts: summarizeBrainNotes(notes),
     notes: notes.slice(-50),
   };
+}
+
+function rebuildCurrentSnapshot(root, notes) {
+  const { current } = brainPaths(root);
+  const snapshot = buildBrainSnapshot(root, notes);
   writeText(current, `${JSON.stringify(snapshot, null, 2)}\n`);
   return snapshot;
 }
@@ -148,7 +152,7 @@ export function loadBrainSnapshot(root) {
 }
 
 export function brainResourceText(root) {
-  const snapshot = loadBrainSnapshot(root);
+  const snapshot = buildBrainSnapshot(root);
   const lines = [
     '# helper-mcp brain',
     '',
@@ -168,4 +172,3 @@ export function brainResourceText(root) {
 
   return lines.join('\n');
 }
-
