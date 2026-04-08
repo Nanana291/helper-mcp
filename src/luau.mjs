@@ -1,8 +1,9 @@
 import fs from 'node:fs';
 import path from 'node:path';
-import { readText, relative, toPosix, walkFiles } from './fs.mjs';
+import crypto from 'node:crypto';
+import { readText, relative, toPosix, walkFiles, writeText } from './fs.mjs';
 
-const LUau_EXTENSIONS = new Set(['.lua', '.luau']);
+const LUAU_EXTENSIONS = new Set(['.lua', '.luau']);
 
 const callbackPatterns = [
   { label: 'signal-connect', re: /\bConnect\s*\(/ },
@@ -117,6 +118,10 @@ export function analyzeLuauText(text, filePath = '') {
     stateCount: categories.state.length,
     uiCount: categories.ui.length,
     riskCount: categories.risks.length,
+    pcallCount: countIdentifiers(source, 'pcall'),
+    loadstringCount: countIdentifiers(source, 'loadstring'),
+    connectCount: countIdentifiers(source, 'Connect'),
+    hash: textHash(source),
   };
 
   return { summary, categories };
@@ -125,7 +130,7 @@ export function analyzeLuauText(text, filePath = '') {
 export function scanLuauWorkspace(root) {
   const files = walkFiles(root, (filePath) => {
     const ext = path.extname(filePath).toLowerCase();
-    return LUau_EXTENSIONS.has(ext);
+    return LUAU_EXTENSIONS.has(ext);
   });
 
   const analyzed = files.map((filePath) => ({

@@ -285,6 +285,61 @@ export function loadBrainSnapshot(root) {
   return rebuildCurrentSnapshot(root, notes);
 }
 
+function inferTagsFromText(text) {
+  const source = normalizeText(text);
+  const tags = [];
+  const tagMap = [
+    ['luau', /\bluau\b/],
+    ['config', /\bconfig\b/],
+    ['baseline', /\bbaseline\b/],
+    ['regression', /\bregression\b/],
+    ['security', /\bsecurity\b|\bwebhook\b|\btoken\b|\bbackdoor\b/],
+    ['performance', /\bperformance\b|\bhot\s*loop\b|\bmemory leak\b/],
+    ['dependency', /\bdependency\b|\brequire\b/],
+    ['template', /\btemplate\b|\bscaffold\b/],
+    ['analysis', /\banalysis\b|\bscan\b|\binspect\b/],
+  ];
+
+  for (const [tag, pattern] of tagMap) {
+    if (pattern.test(source)) {
+      tags.push(tag);
+    }
+  }
+
+  return tags;
+}
+
+function parseImportSource(filePath) {
+  const text = readText(filePath);
+  const ext = path.extname(filePath).toLowerCase();
+  if (ext === '.json') {
+    const parsed = (() => {
+      try {
+        return JSON.parse(text);
+      } catch {
+        return null;
+      }
+    })();
+    if (parsed && typeof parsed === 'object') {
+      const title = String(parsed.title || parsed.name || parsed.id || path.basename(filePath)).trim();
+      const summary = String(parsed.summary || parsed.description || parsed.note || '').trim() || `Imported from ${path.basename(filePath)}`;
+      return { title, summary, tags: inferTagsFromText(`${title} ${summary} ${JSON.stringify(parsed)}`), evidence: text.trim(), sourcePath: toPosix(filePath) };
+    }
+  }
+
+  const lines = text.split(/\r?\n/).map((line) => line.trim()).filter(Boolean);
+  const titleLine = lines.find((line) => /^#{1,3}\s+/.test(line)) || lines[0] || path.basename(filePath);
+  const title = titleLine.replace(/^#{1,3}\s+/, '').trim();
+  const summary = lines.slice(1, 6).join(' ').slice(0, 240) || `Imported from ${path.basename(filePath)}`;
+  return {
+    title,
+    summary,
+    tags: inferTagsFromText(`${title} ${summary} ${text}`),
+    evidence: lines.slice(0, 12).join('\n'),
+    sourcePath: toPosix(filePath),
+  };
+}
+
 export function brainResourceText(root) {
   const snapshot = buildBrainSnapshot(root);
   const lines = [

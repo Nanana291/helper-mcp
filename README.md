@@ -2,6 +2,8 @@
 
 `helper-mcp` is a local MCP server that gives coding agents a Luau-first second brain.
 
+Version `0.5.0` expands the Luau and workspace toolset with repair, security, baseline, config, and changelog helpers.
+
 It is designed to help with tasks like:
 
 - scanning Luau scripts for callbacks, remotes, UI wiring, and state patterns
@@ -16,10 +18,20 @@ It is designed to help with tasks like:
 - `brain.add`
 - `brain.search`
 - `brain.snapshot`
+- `brain.import`
 - `luau.scan`
 - `luau.inspect`
 - `luau.compare`
 - `luau.note`
+- `luau.hotfix`
+- `luau.decompile`
+- `luau.security_scan`
+- `luau.performance_profile`
+- `luau.dependency_map`
+- `luau.template`
+- `workspace.baseline`
+- `workspace.changelog`
+- `config.validate`
 
 The advertised tool names use underscore-friendly aliases for maximum client compatibility,
 for example `brain_snapshot` instead of `brain.snapshot`.

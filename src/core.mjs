@@ -156,9 +156,9 @@ function toolAnnotations(canonicalName) {
   const readOnly = readOnlyTools.has(canonicalName);
   return {
     title: canonicalName.replace(/\./g, ' '),
-    readOnlyHint: readOnly,
-    destructiveHint: !readOnly,
-    idempotentHint: readOnly,
+    readOnlyHint: readOnlyNames.has(canonicalName),
+    destructiveHint: !readOnlyNames.has(canonicalName),
+    idempotentHint: readOnlyNames.has(canonicalName),
     openWorldHint: false,
   };
 }
@@ -419,24 +419,70 @@ const toolDefinitions = [
       required: ['oldPath', 'newPath'],
       additionalProperties: false,
     },
-  },
-  {
-    canonicalName: 'luau.note',
-    aliases: ['luau.note', 'luau_note'],
-    description: 'Store a Luau-specific lesson in the local helper brain.',
-    inputSchema: {
-      type: 'object',
-      properties: {
-        title: { type: 'string' },
-        summary: { type: 'string' },
-        sourcePath: { type: 'string' },
-        tags: { type: 'array', items: { type: 'string' } },
-        evidence: { type: 'string' },
-      },
-      required: ['title', 'summary'],
-      additionalProperties: false,
+    required: ['filePath'],
+    additionalProperties: false,
+  }),
+  toolDefinition('luau.security_scan', ['luau.security_scan', 'luau_security_scan'], 'Audit Luau scripts for webhook leaks, token exfiltration, and backdoor patterns.', {
+    type: 'object',
+    properties: {
+      filePath: { type: 'string' },
     },
-  },
+    required: ['filePath'],
+    additionalProperties: false,
+  }),
+  toolDefinition('luau.performance_profile', ['luau.performance_profile', 'luau_performance_profile'], 'Profile Luau scripts for loop pressure, register hotspots, and cleanup risks.', {
+    type: 'object',
+    properties: {
+      filePath: { type: 'string' },
+    },
+    required: ['filePath'],
+    additionalProperties: false,
+  }),
+  toolDefinition('luau.dependency_map', ['luau.dependency_map', 'luau_dependency_map'], 'Map cross-file Luau dependencies and detect unused imports.', {
+    type: 'object',
+    properties: {
+      targetPath: { type: 'string' },
+    },
+    additionalProperties: false,
+  }),
+  toolDefinition('luau.template', ['luau.template', 'luau_template'], 'Generate a Luau scaffold with safety and cleanup patterns.', {
+    type: 'object',
+    properties: {
+      templateType: { type: 'string' },
+      name: { type: 'string' },
+      outputPath: { type: 'string' },
+    },
+    additionalProperties: false,
+  }),
+  toolDefinition('workspace.baseline', ['workspace.baseline', 'workspace_baseline'], 'Capture a regression baseline for a workspace or script path.', {
+    type: 'object',
+    properties: {
+      targetPath: { type: 'string' },
+      outputPath: { type: 'string' },
+      label: { type: 'string' },
+    },
+    additionalProperties: false,
+  }),
+  toolDefinition('workspace.changelog', ['workspace.changelog', 'workspace_changelog'], 'Generate a changelog from a baseline comparison.', {
+    type: 'object',
+    properties: {
+      baselinePath: { type: 'string' },
+      targetPath: { type: 'string' },
+      title: { type: 'string' },
+    },
+    required: ['baselinePath'],
+    additionalProperties: false,
+  }),
+  toolDefinition('config.validate', ['config.validate', 'config_validate'], 'Validate a LibSixtyTen config file against inferred or supplied schema rules.', {
+    type: 'object',
+    properties: {
+      filePath: { type: 'string' },
+      schemaPath: { type: 'string' },
+      record: { type: 'boolean' },
+    },
+    required: ['filePath'],
+    additionalProperties: false,
+  }),
 ];
 
 // ── Public API ────────────────────────────────────────────────────────────────
@@ -490,6 +536,16 @@ export function healthcheckPayload(workspaceRoot) {
     canonicalTools: getCanonicalToolNames(),
     aliasesByTool: getAliasesByTool(),
   };
+}
+
+function resolveFilePath(workspaceRoot, filePath) {
+  const trimmed = String(filePath || '').trim();
+  return trimmed ? (path.isAbsolute(trimmed) ? trimmed : path.resolve(workspaceRoot, trimmed)) : '';
+}
+
+function resolveOptionalPath(workspaceRoot, filePath) {
+  const trimmed = String(filePath || '').trim();
+  return trimmed ? (path.isAbsolute(trimmed) ? trimmed : path.resolve(workspaceRoot, trimmed)) : '';
 }
 
 export function handleTool(workspaceRoot, requestedName, args = {}) {

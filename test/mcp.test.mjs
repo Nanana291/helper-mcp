@@ -28,6 +28,11 @@ test('helper-mcp exposes compatibility aliases and resources', async () => {
     assert.ok(toolNames.includes('healthcheck'));
     assert.ok(toolNames.includes('workspace_summary'));
     assert.ok(toolNames.includes('brain_snapshot'));
+    assert.ok(toolNames.includes('brain_import'));
+    assert.ok(toolNames.includes('luau_hotfix'));
+    assert.ok(toolNames.includes('luau_decompile'));
+    assert.ok(toolNames.includes('workspace_baseline'));
+    assert.ok(toolNames.includes('config_validate'));
 
     const resources = await client.listResources();
     const resourceUris = resources.resources.map((resource) => resource.uri);
