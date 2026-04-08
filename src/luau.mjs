@@ -306,3 +306,298 @@ export function patternSearchLuau(root, rawPattern, { maxResults = 100, context 
     matches,
   };
 }
+
+// ── Flag Analysis ─────────────────────────────────────────────────────────────
+
+/**
+ * Extract all LibSixtyTen Flag definitions and reads from Luau text.
+ * Detects duplicates and orphaned flags.
+ */
+export function extractFlagsFromText(text, filePath = '') {
+  const lines = text.split(/\r?\n/);
+  const defined = [];
+  const read = [];
+
+  for (let i = 0; i < lines.length; i++) {
+    const line = lines[i];
+
+    // Flag definition: Flag = "Name" or Flag = 'Name'
+    const defMatch = /\bFlag\s*=\s*["']([^"']+)["']/.exec(line);
+    if (defMatch) {
+      defined.push({ name: defMatch[1], line: i + 1, text: line.trim() });
+    }
+
+    // Flag reads: Library.Flags["Name"], Flags["Name"], Library.Flags.Name, Flags.Name
+    const readMatch = /(?:Library\.)?Flags\[["']([^"']+)["']\]|(?:Library\.)?Flags\.(\w+)/.exec(line);
+    if (readMatch) {
+      const name = readMatch[1] || readMatch[2];
+      if (name) read.push({ name, line: i + 1, text: line.trim() });
+    }
+  }
+
+  const nameCounts = {};
+  for (const d of defined) {
+    nameCounts[d.name] = (nameCounts[d.name] || 0) + 1;
+  }
+
+  const definedNames = new Set(defined.map((d) => d.name));
+  const readNames = new Set(read.map((r) => r.name));
+
+  const duplicates = Object.entries(nameCounts)
+    .filter(([, count]) => count > 1)
+    .map(([name, count]) => ({
+      name,
+      count,
+      occurrences: defined.filter((d) => d.name === name),
+    }));
+
+  return {
+    filePath: toPosix(filePath),
+    totalDefined: defined.length,
+    totalRead: read.length,
+    duplicates,
+    hasDuplicates: duplicates.length > 0,
+    orphanedDefined: defined.filter((d) => !readNames.has(d.name)),
+    orphanedRead: read.filter((r) => !definedNames.has(r.name)),
+    allFlags: defined,
+  };
+}
+
+// ── UI Map Extraction ─────────────────────────────────────────────────────────
+
+const UI_CONTAINERS = ['Page', 'Category', 'Section'];
+const UI_CONTROLS = ['Toggle', 'Button', 'Slider', 'Dropdown', 'DropdownAmount', 'Textbox', 'Paragraph', 'Label', 'Divider', 'Keybind', 'Colorpicker'];
+const UI_ALL = [...UI_CONTAINERS, ...UI_CONTROLS];
+
+/**
+ * Extract the Page→Category→Section→Controls hierarchy from a LibSixtyTen script.
+ * Uses heuristic regex: handles single-line definitions and multi-line with Name on first line.
+ */
+export function extractUIMap(text, filePath = '') {
+  const lines = text.split(/\r?\n/);
+  const nodes = [];
+
+  for (let i = 0; i < lines.length; i++) {
+    const line = lines[i];
+    // Look ahead for Name if not on same line (handles 2-line case)
+    const context = line + (lines[i + 1] || '');
+
+    for (const method of UI_ALL) {
+      // With assignment: local VarName = ParentVar:Method({...
+      const assignRe = new RegExp(`local\\s+(\\w+)\\s*=\\s*(\\w+):${method}\\s*\\(`);
+      const assignMatch = assignRe.exec(line);
+      if (assignMatch) {
+        const nameMatch = /Name\s*=\s*["']([^"']+)["']/.exec(context);
+        const flagMatch = /Flag\s*=\s*["']([^"']+)["']/.exec(context);
+        nodes.push({
+          varName: assignMatch[1],
+          type: method,
+          name: nameMatch ? nameMatch[1] : '?',
+          parentVar: assignMatch[2],
+          line: i + 1,
+          flag: flagMatch ? flagMatch[1] : null,
+        });
+        break;
+      }
+
+      // Without assignment: ParentVar:Method({...
+      const callRe = new RegExp(`(\\w+):${method}\\s*\\(`);
+      const callMatch = callRe.exec(line);
+      if (callMatch && !/^\s*(?:local\s+\w+\s*=\s*)?\w+:(?:Window|Library)/.test(line)) {
+        if (line.includes(`local `) && assignRe.test(line)) break;
+        const nameMatch = /Name\s*=\s*["']([^"']+)["']/.exec(context);
+        const flagMatch = /Flag\s*=\s*["']([^"']+)["']/.exec(context);
+        nodes.push({
+          varName: null,
+          type: method,
+          name: nameMatch ? nameMatch[1] : '?',
+          parentVar: callMatch[1],
+          line: i + 1,
+          flag: flagMatch ? flagMatch[1] : null,
+        });
+        break;
+      }
+    }
+  }
+
+  // Build tree
+  const byVar = {};
+  for (const node of nodes) {
+    if (node.varName) byVar[node.varName] = node;
+  }
+
+  const childrenMap = {};
+  const roots = [];
+
+  for (const node of nodes) {
+    if (byVar[node.parentVar]) {
+      if (!childrenMap[node.parentVar]) childrenMap[node.parentVar] = [];
+      childrenMap[node.parentVar].push(node);
+    } else {
+      roots.push(node);
+    }
+  }
+
+  function buildNode(node) {
+    const result = { type: node.type, name: node.name, line: node.line };
+    if (node.flag) result.flag = node.flag;
+    const kids = node.varName ? childrenMap[node.varName] : null;
+    if (kids && kids.length > 0) result.children = kids.map(buildNode);
+    return result;
+  }
+
+  return {
+    filePath: toPosix(filePath),
+    summary: {
+      pages: nodes.filter((n) => n.type === 'Page').length,
+      sections: nodes.filter((n) => n.type === 'Section').length,
+      controls: nodes.filter((n) => UI_CONTROLS.includes(n.type)).length,
+    },
+    tree: roots.map(buildNode),
+  };
+}
+
+// ── Migration Checklist ───────────────────────────────────────────────────────
+
+/**
+ * Semantic migration checklist between two Luau files.
+ * Returns a verdict (BLOCKED / REVIEW / READY) and a prioritized checklist.
+ */
+export function migrationChecklist(root, oldPath, newPath) {
+  const oldFile = path.isAbsolute(oldPath) ? oldPath : path.join(root, oldPath);
+  const newFile = path.isAbsolute(newPath) ? newPath : path.join(root, newPath);
+  const oldText = readText(oldFile);
+  const newText = readText(newFile);
+
+  const oldA = analyzeLuauText(oldText, oldPath);
+  const newA = analyzeLuauText(newText, newPath);
+  const oldF = extractFlagsFromText(oldText, oldPath);
+  const newF = extractFlagsFromText(newText, newPath);
+
+  const oldFlagNames = new Set(oldF.allFlags.map((f) => f.name));
+  const newFlagNames = new Set(newF.allFlags.map((f) => f.name));
+
+  const lostFlags = [...oldFlagNames].filter((n) => !newFlagNames.has(n));
+  const addedFlags = [...newFlagNames].filter((n) => !oldFlagNames.has(n));
+
+  const hasPattern = (t, re) => re.test(t);
+  const checklist = [];
+
+  // Saved config loss — HIGH
+  if (lostFlags.length > 0) {
+    checklist.push({
+      severity: 'high',
+      check: 'saved-config-loss',
+      pass: false,
+      detail: `${lostFlags.length} flag(s) in old missing from new: [${lostFlags.join(', ')}] — saved user config will be lost unless migrated.`,
+    });
+  }
+
+  // Autoload — HIGH
+  const oldAutoload = hasPattern(oldText, /LoadAutoloadConfig\s*\(/);
+  const newAutoload = hasPattern(newText, /LoadAutoloadConfig\s*\(/);
+  checklist.push({
+    severity: 'high',
+    check: 'autoload-present',
+    pass: newAutoload || !oldAutoload,
+    detail: oldAutoload && !newAutoload
+      ? 'LoadAutoloadConfig present in old but MISSING in new — config will not restore on load.'
+      : newAutoload ? 'LoadAutoloadConfig present in new version.' : 'LoadAutoloadConfig absent in both versions.',
+  });
+
+  // Dashboard init — HIGH
+  const oldDash = hasPattern(oldText, /CreateDashboard\s*\(/);
+  const newDash = hasPattern(newText, /CreateDashboard\s*\(/);
+  checklist.push({
+    severity: 'high',
+    check: 'dashboard-init',
+    pass: newDash || !oldDash,
+    detail: oldDash && !newDash
+      ? 'CreateDashboard present in old but MISSING in new — UI will not initialize.'
+      : newDash ? 'CreateDashboard present in new version.' : 'CreateDashboard absent in both versions.',
+  });
+
+  // Remote loss — MEDIUM
+  const remoteDelta = newA.summary.remoteCount - oldA.summary.remoteCount;
+  if (remoteDelta < 0) {
+    checklist.push({
+      severity: 'medium',
+      check: 'remote-loss',
+      pass: false,
+      detail: `${Math.abs(remoteDelta)} fewer remote call(s) in new — verify each removal is intentional.`,
+    });
+  }
+
+  // Callback loss — MEDIUM
+  const callbackDelta = newA.summary.callbackCount - oldA.summary.callbackCount;
+  if (callbackDelta < 0) {
+    checklist.push({
+      severity: 'medium',
+      check: 'callback-loss',
+      pass: false,
+      detail: `${Math.abs(callbackDelta)} fewer callback(s) in new — verify each removal is intentional.`,
+    });
+  }
+
+  // New risks — MEDIUM
+  const newRisks = newA.summary.riskCount - oldA.summary.riskCount;
+  if (newRisks > 0) {
+    checklist.push({
+      severity: 'medium',
+      check: 'new-risks',
+      pass: false,
+      detail: `${newRisks} new risk(s) introduced in new version.`,
+    });
+  }
+
+  // pcall coverage in new — MEDIUM
+  const missingPcall = newA.categories.risks.filter((r) => r.label === 'missing-pcall').length;
+  checklist.push({
+    severity: 'medium',
+    check: 'pcall-coverage',
+    pass: missingPcall === 0,
+    detail: missingPcall > 0
+      ? `${missingPcall} remote call(s) without pcall in new version.`
+      : 'All remote calls have pcall coverage in new version.',
+  });
+
+  // New flags — ADVISORY
+  if (addedFlags.length > 0) {
+    checklist.push({
+      severity: 'advisory',
+      check: 'new-flags',
+      pass: true,
+      detail: `${addedFlags.length} new flag(s) in new version: [${addedFlags.join(', ')}] — verify they have sensible defaults.`,
+    });
+  }
+
+  // Flag duplicates in new — HIGH
+  if (newF.hasDuplicates) {
+    checklist.push({
+      severity: 'high',
+      check: 'duplicate-flags',
+      pass: false,
+      detail: `${newF.duplicates.length} duplicate Flag value(s) in new version: [${newF.duplicates.map((d) => d.name).join(', ')}] — two controls will share state.`,
+    });
+  }
+
+  const blockers = checklist.filter((c) => !c.pass && c.severity === 'high');
+  const warnings = checklist.filter((c) => !c.pass && c.severity === 'medium');
+
+  return {
+    paths: { old: toPosix(oldPath), new: toPosix(newPath) },
+    summary: {
+      oldLines: oldA.summary.lineCount,
+      newLines: newA.summary.lineCount,
+      lineDelta: newA.summary.lineCount - oldA.summary.lineCount,
+      oldFlags: oldFlagNames.size,
+      newFlags: newFlagNames.size,
+      lostFlags: lostFlags.length,
+      addedFlags: addedFlags.length,
+    },
+    verdict: blockers.length > 0 ? 'BLOCKED' : warnings.length > 0 ? 'REVIEW' : 'READY',
+    blockers: blockers.length,
+    warnings: warnings.length,
+    checklist,
+  };
+}

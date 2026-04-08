@@ -333,3 +333,22 @@ export function updateBrainNote(root, id, fields = {}) {
   const snapshot = rebuildCurrentSnapshot(root, notes);
   return { ok: true, note: notes[idx], counts: snapshot.counts };
 }
+
+/**
+ * Store a structured lesson in mistake→fix→rule format.
+ * Automatically tagged as 'learned' and set to status 'active'.
+ */
+export function teachBrainLesson(root, { mistake, fix, rule, sourcePath, tags }) {
+  if (!mistake || !fix || !rule) return { ok: false, error: 'mistake, fix, and rule are all required.' };
+  const summary = `Mistake: ${String(mistake).trim()}\n\nFix: ${String(fix).trim()}\n\nRule: ${String(rule).trim()}`;
+  const snapshot = appendBrainNote(root, {
+    title: String(rule).trim(),
+    summary,
+    scope: 'learned',
+    status: 'active',
+    tags: ['learned', ...Array.isArray(tags) ? tags.map(String).map((t) => t.trim()).filter(Boolean) : []],
+    sourcePath: String(sourcePath || '').trim(),
+    evidence: String(mistake).trim(),
+  });
+  return { ok: true, message: 'Lesson stored.', counts: snapshot.counts };
+}
