@@ -45,7 +45,7 @@ test('helper-mcp exposes compatibility aliases and resources', async () => {
     const text = result.content.map((block) => block.text || '').join('\n');
 
     assert.match(text, /"ok": true/);
-    assert.match(text, /"canonicalToolCount": 9/);
+    assert.match(text, /"canonicalToolCount": 16/);
   } finally {
     await client.close?.();
     await transport.close();

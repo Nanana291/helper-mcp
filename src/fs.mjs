@@ -1,12 +1,18 @@
 import fs from 'node:fs';
 import path from 'node:path';
 import process from 'node:process';
+import os from 'node:os';
 
 const ignoredDirNames = new Set(['.git', 'node_modules', '.helper-mcp']);
 
 export function resolveWorkspaceRoot() {
   const envRoot = String(process.env.HELPER_MCP_ROOT || '').trim();
-  return envRoot ? path.resolve(envRoot) : process.cwd();
+  if (!envRoot) return process.cwd();
+  // Support ~ expansion
+  if (envRoot === '~' || envRoot.startsWith('~/') || envRoot.startsWith('~\\')) {
+    return path.resolve(os.homedir() + envRoot.slice(1));
+  }
+  return path.resolve(envRoot);
 }
 
 export function readText(filePath) {
@@ -62,4 +68,3 @@ export function normalizeText(value) {
 export function toPosix(filePath) {
   return String(filePath || '').split(path.sep).join('/');
 }
-

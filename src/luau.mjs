@@ -49,6 +49,13 @@ const riskPatterns = [
   { label: 'unbounded-loop', re: /\bwhile\s+true\s+do\b/ },
 ];
 
+// Patterns for extracting named functions (used by luau.diff)
+const functionPatterns = [
+  /\blocal\s+function\s+(\w+)/,
+  /\bfunction\s+(\w[\w.:]*)\s*\(/,
+  /\b(\w+)\s*=\s*function\s*\(/,
+];
+
 function getMatches(lines, pattern) {
   const matches = [];
   for (let index = 0; index < lines.length; index += 1) {
@@ -59,20 +66,52 @@ function getMatches(lines, pattern) {
   return matches;
 }
 
+/**
+ * Detect FireServer / InvokeServer calls that are NOT wrapped in pcall on the same line.
+ */
+function getMissingPcallMatches(lines) {
+  const remoteCallRe = /:FireServer\s*\(|:InvokeServer\s*\(/;
+  const matches = [];
+  for (let i = 0; i < lines.length; i++) {
+    if (remoteCallRe.test(lines[i]) && !/\bpcall\b/.test(lines[i])) {
+      matches.push({ line: i + 1, text: lines[i].trim(), label: 'missing-pcall' });
+    }
+  }
+  return matches;
+}
+
 export function analyzeLuauText(text, filePath = '') {
   const source = String(text || '');
   const lines = source.split(/\r?\n/);
+
+  // Count local declarations as a register-pressure heuristic
+  const localCount = lines.filter((l) => /^\s*local\s+/.test(l)).length;
+
   const categories = {
     callbacks: callbackPatterns.flatMap((pattern) => getMatches(lines, pattern).map((match) => ({ ...match, label: pattern.label }))),
     remotes: remotePatterns.flatMap((pattern) => getMatches(lines, pattern).map((match) => ({ ...match, label: pattern.label }))),
     state: statePatterns.flatMap((pattern) => getMatches(lines, pattern).map((match) => ({ ...match, label: pattern.label }))),
     ui: uiPatterns.flatMap((pattern) => getMatches(lines, pattern).map((match) => ({ ...match, label: pattern.label }))),
-    risks: riskPatterns.flatMap((pattern) => getMatches(lines, pattern).map((match) => ({ ...match, label: pattern.label }))),
+    risks: [
+      ...riskPatterns.flatMap((pattern) => getMatches(lines, pattern).map((match) => ({ ...match, label: pattern.label }))),
+      ...getMissingPcallMatches(lines),
+    ],
   };
+
+  // Flag register pressure as a synthetic risk entry
+  if (localCount > 150) {
+    const severity = localCount > 180 ? 'critical' : 'warning';
+    categories.risks.push({
+      line: 0,
+      text: `~${localCount} local declarations detected (limit: 200)`,
+      label: `local-pressure-${severity}`,
+    });
+  }
 
   const summary = {
     filePath: toPosix(filePath),
     lineCount: lines.length,
+    localCount,
     callbackCount: categories.callbacks.length,
     remoteCount: categories.remotes.length,
     stateCount: categories.state.length,
@@ -129,11 +168,66 @@ export function compareLuauFiles(root, currentPath, baselinePath) {
   };
 }
 
+/**
+ * Structural diff between two Luau files.
+ * Reports added/removed functions, and delta counts for remotes and callbacks.
+ */
+export function diffLuauFiles(root, pathA, pathB) {
+  const fileA = path.isAbsolute(pathA) ? pathA : path.join(root, pathA);
+  const fileB = path.isAbsolute(pathB) ? pathB : path.join(root, pathB);
+
+  function extractStructure(filePath) {
+    const text = readText(filePath);
+    const lines = text.split(/\r?\n/);
+    const functions = [];
+    const remotes = [];
+    const callbacks = [];
+
+    for (let i = 0; i < lines.length; i++) {
+      const line = lines[i];
+      for (const pat of functionPatterns) {
+        const m = pat.exec(line);
+        if (m) {
+          functions.push({ name: m[1], line: i + 1 });
+          break;
+        }
+      }
+      for (const rp of remotePatterns) {
+        if (rp.re.test(line)) remotes.push({ label: rp.label, line: i + 1, text: line.trim() });
+      }
+      for (const cp of callbackPatterns) {
+        if (cp.re.test(line)) callbacks.push({ label: cp.label, line: i + 1, text: line.trim() });
+      }
+    }
+
+    return { functions, remotes, callbacks, lineCount: lines.length };
+  }
+
+  const a = extractStructure(fileA);
+  const b = extractStructure(fileB);
+
+  const namesA = new Set(a.functions.map((f) => f.name));
+  const namesB = new Set(b.functions.map((f) => f.name));
+
+  return {
+    paths: { a: toPosix(pathA), b: toPosix(pathB) },
+    lines: { a: a.lineCount, b: b.lineCount, delta: b.lineCount - a.lineCount },
+    functions: {
+      added: b.functions.filter((f) => !namesA.has(f.name)),
+      removed: a.functions.filter((f) => !namesB.has(f.name)),
+      unchanged: a.functions.filter((f) => namesB.has(f.name)).length,
+    },
+    remotes: { a: a.remotes.length, b: b.remotes.length, delta: b.remotes.length - a.remotes.length },
+    callbacks: { a: a.callbacks.length, b: b.callbacks.length, delta: b.callbacks.length - a.callbacks.length },
+  };
+}
+
 export function formatLuauAnalysis(report) {
   const lines = [];
   lines.push(`# ${report.summary.filePath || 'Luau file'}`);
   lines.push('');
   lines.push(`Lines: ${report.summary.lineCount}`);
+  lines.push(`Locals: ${report.summary.localCount} / 200`);
   lines.push(`Callbacks: ${report.summary.callbackCount}`);
   lines.push(`Remotes: ${report.summary.remoteCount}`);
   lines.push(`State refs: ${report.summary.stateCount}`);
@@ -155,4 +249,3 @@ export function formatLuauAnalysis(report) {
 
   return lines.join('\n').trimEnd() + '\n';
 }
-

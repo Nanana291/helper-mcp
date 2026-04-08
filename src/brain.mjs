@@ -34,6 +34,12 @@ function loadNotes(root) {
     .filter(Boolean);
 }
 
+function rebuildNotesFile(root, notes) {
+  const { dir, notes: notesPath } = brainPaths(root);
+  fs.mkdirSync(dir, { recursive: true });
+  fs.writeFileSync(notesPath, notes.map((n) => JSON.stringify(n)).join('\n') + '\n', 'utf8');
+}
+
 export function summarizeBrainNotes(notes) {
   const counts = {
     total: notes.length,
@@ -92,58 +98,186 @@ export function appendBrainNote(root, note) {
   return rebuildCurrentSnapshot(root, loadNotes(root));
 }
 
-export function listBrainNotes(root) {
-  return loadNotes(root);
+export function promoteBrainNote(root, id, newStatus) {
+  const notes = loadNotes(root);
+  const idx = notes.findIndex((n) => n.id === id);
+  if (idx === -1) return { ok: false, error: `Note not found: ${id}` };
+  notes[idx] = { ...notes[idx], status: String(newStatus || 'active').trim().toLowerCase(), updatedAt: new Date().toISOString() };
+  rebuildNotesFile(root, notes);
+  const snapshot = rebuildCurrentSnapshot(root, notes);
+  return { ok: true, note: notes[idx], counts: snapshot.counts };
 }
 
-export function searchBrainNotes(root, query) {
-  const normalizedQuery = normalizeText(query);
-  if (!normalizedQuery) {
-    return [];
+export function tagBrainNote(root, id, tagsToAdd) {
+  const notes = loadNotes(root);
+  const idx = notes.findIndex((n) => n.id === id);
+  if (idx === -1) return { ok: false, error: `Note not found: ${id}` };
+  const existing = Array.isArray(notes[idx].tags) ? notes[idx].tags : [];
+  const merged = [...new Set([...existing, ...tagsToAdd.map(String).map((t) => t.trim()).filter(Boolean)])];
+  notes[idx] = { ...notes[idx], tags: merged, updatedAt: new Date().toISOString() };
+  rebuildNotesFile(root, notes);
+  const snapshot = rebuildCurrentSnapshot(root, notes);
+  return { ok: true, note: notes[idx], counts: snapshot.counts };
+}
+
+export function listBrainNotes(root, { status, tag, limit = 50 } = {}) {
+  let notes = loadNotes(root);
+  if (status) {
+    const s = String(status).trim().toLowerCase();
+    notes = notes.filter((n) => n.status === s);
   }
+  if (tag) {
+    const t = String(tag).trim().toLowerCase();
+    notes = notes.filter((n) => Array.isArray(n.tags) && n.tags.some((x) => x.toLowerCase() === t));
+  }
+  return notes.slice(-Math.max(1, Number(limit) || 50));
+}
+
+export function exportBrainToMarkdown(root) {
+  const notes = loadNotes(root);
+  const byScope = {};
+  for (const note of notes) {
+    const scope = note.scope || 'workspace';
+    if (!byScope[scope]) byScope[scope] = [];
+    byScope[scope].push(note);
+  }
+
+  const lines = [
+    '# Brain Export',
+    '',
+    `Generated: ${new Date().toISOString()}`,
+    `Total notes: ${notes.length}`,
+    '',
+  ];
+
+  for (const [scope, scopeNotes] of Object.entries(byScope).sort()) {
+    lines.push(`## ${scope}`, '');
+    for (const note of scopeNotes) {
+      lines.push(`### ${note.title}`);
+      lines.push(`- **Status:** ${note.status}`);
+      lines.push(`- **Tags:** ${note.tags && note.tags.length ? note.tags.join(', ') : 'none'}`);
+      if (note.sourcePath) lines.push(`- **Source:** ${note.sourcePath}`);
+      lines.push('');
+      lines.push(note.summary);
+      if (note.evidence) {
+        lines.push('');
+        lines.push(`**Evidence:** ${note.evidence}`);
+      }
+      lines.push('');
+    }
+  }
+
+  return lines.join('\n');
+}
+
+/**
+ * Improved search: tokenized, weighted field scoring, ranked results, file snippets.
+ *
+ * Weights: title=4, tags=3, summary=2, scope=1, evidence=1
+ * Bonuses: exact phrase in title (+5), all tokens matched (+3)
+ */
+export function searchBrainNotes(root, query, { limit = 30 } = {}) {
+  const tokens = normalizeText(query).split(/\s+/).filter(Boolean);
+  if (tokens.length === 0) return [];
 
   const notes = loadNotes(root);
   const files = walkFiles(root, (filePath) => {
-    const relativePath = toPosix(relative(root, filePath));
-    return relativePath.endsWith('.lua') || relativePath.endsWith('.luau') || relativePath.endsWith('.md') || relativePath.endsWith('.json');
+    const rel = toPosix(relative(root, filePath));
+    return rel.endsWith('.lua') || rel.endsWith('.luau') || rel.endsWith('.md') || rel.endsWith('.json');
   });
 
   const hits = [];
+
+  // Score notes
   for (const note of notes) {
-    const haystack = normalizeText([
-      note.id,
-      note.title,
-      note.summary,
-      note.scope,
-      note.status,
-      note.tags.join(' '),
-      note.sourcePath,
-      note.evidence,
-    ].join(' '));
-    if (haystack.includes(normalizedQuery)) {
+    const fields = {
+      title: normalizeText(note.title),
+      tags: normalizeText(Array.isArray(note.tags) ? note.tags.join(' ') : ''),
+      summary: normalizeText(note.summary),
+      scope: normalizeText(note.scope),
+      evidence: normalizeText(note.evidence),
+    };
+    const weights = { title: 4, tags: 3, summary: 2, scope: 1, evidence: 1 };
+
+    let score = 0;
+    let matched = 0;
+    for (const token of tokens) {
+      let tokenHit = false;
+      for (const [field, text] of Object.entries(fields)) {
+        if (text.includes(token)) {
+          score += weights[field];
+          tokenHit = true;
+        }
+      }
+      if (tokenHit) matched++;
+    }
+
+    // Exact phrase bonus
+    if (tokens.length > 1 && fields.title.includes(normalizeText(query))) {
+      score += 5;
+    }
+    // All-tokens match bonus
+    if (matched === tokens.length) {
+      score += 3;
+    }
+
+    if (score > 0) {
       hits.push({
         type: 'note',
+        score,
         id: note.id,
         title: note.title,
         scope: note.scope,
         status: note.status,
         summary: note.summary,
+        tags: note.tags,
+        sourcePath: note.sourcePath,
       });
     }
   }
 
+  // Score files with snippets
   for (const file of files) {
-    const text = normalizeText(readText(file));
+    const text = readText(file);
     if (!text) continue;
-    if (text.includes(normalizedQuery)) {
-      hits.push({
-        type: 'file',
-        path: toPosix(relative(root, file)),
-      });
+    const lines = text.split(/\r?\n/);
+
+    let score = 0;
+    let matched = 0;
+    let snippet = '';
+    let snippetLine = 0;
+
+    for (let i = 0; i < lines.length; i++) {
+      const normalized = normalizeText(lines[i]);
+      let lineHit = false;
+      for (const token of tokens) {
+        if (normalized.includes(token)) {
+          score++;
+          lineHit = true;
+        }
+      }
+      if (lineHit && !snippet) {
+        snippet = lines[i].trim().slice(0, 120);
+        snippetLine = i + 1;
+      }
     }
+
+    for (const token of tokens) {
+      if (normalizeText(text).includes(token)) matched++;
+    }
+    if (matched === 0) continue;
+    if (matched === tokens.length && tokens.length > 1) score += 2;
+
+    hits.push({
+      type: 'file',
+      score,
+      path: toPosix(relative(root, file)),
+      snippet,
+      snippetLine,
+    });
   }
 
-  return hits;
+  return hits.sort((a, b) => b.score - a.score).slice(0, Math.max(1, Number(limit) || 30));
 }
 
 export function loadBrainSnapshot(root) {
