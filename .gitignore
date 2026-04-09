@@ -1,5 +1,5 @@
 node_modules
 .helper-mcp
+.worktrees
 npm-debug.log*
 *.log
-
