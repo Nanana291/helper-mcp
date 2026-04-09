@@ -1869,3 +1869,382 @@ export function writeLuauHotfixSnapshots(root, filePath, report) {
   }, null, 2)}\n`);
   return snapshotPath;
 }
+
+// ── Remote Payload Analysis ───────────────────────────────────────────────────
+
+/**
+ * Deep analysis of FireServer / InvokeServer calls.
+ * Extracts payload structure: table keys, literal values, variable references.
+ * Groups by remote object name and generates reference documentation.
+ */
+export function extractRemotePayloads(text, filePath = '') {
+  const lines = text.split(/\r?\n/);
+  const remotes = [];
+
+  for (let i = 0; i < lines.length; i++) {
+    const line = lines[i];
+    const lineRe = /(\w[\w.]*)\s*:\s*(FireServer|InvokeServer)\s*\(([\s\S]*)/;
+    const match = lineRe.exec(line);
+    if (!match) continue;
+
+    const remoteName = match[1];
+    const method = match[2];
+    const restOfLine = match[3];
+
+    // Collect full payload string (may span multiple lines)
+    let payloadStr = restOfLine;
+    let scanLine = i;
+    let parenDepth = 1;
+    while (scanLine < lines.length && parenDepth > 0) {
+      const scanText = scanLine === i ? restOfLine : lines[scanLine];
+      for (const ch of scanText) {
+        if (ch === '(') parenDepth++;
+        else if (ch === ')') {
+          parenDepth--;
+          if (parenDepth === 0) break;
+        }
+      }
+      if (parenDepth > 0) {
+        scanLine++;
+        if (scanLine < lines.length) {
+          payloadStr += '\n' + lines[scanLine];
+        }
+      }
+    }
+
+    payloadStr = payloadStr.replace(/\)\s*$/, '').trim();
+    const payload = analyzePayload(payloadStr);
+
+    remotes.push({
+      remote: remoteName,
+      method,
+      line: i + 1,
+      payload,
+      rawSnippet: payloadStr.slice(0, 200),
+    });
+  }
+
+  const byRemote = {};
+  for (const r of remotes) {
+    if (!byRemote[r.remote]) byRemote[r.remote] = [];
+    byRemote[r.remote].push({ method: r.method, line: r.line, payload: r.payload, rawSnippet: r.rawSnippet });
+  }
+
+  const summary = {
+    totalCalls: remotes.length,
+    uniqueRemotes: Object.keys(byRemote).length,
+    remoteNames: Object.keys(byRemote).sort(),
+    callSites: remotes.map((r) => ({ remote: r.remote, method: r.method, line: r.line })),
+    byRemote,
+  };
+
+  return {
+    filePath: toPosix(filePath),
+    summary,
+    remotes,
+  };
+}
+
+function analyzePayload(payloadStr) {
+  const payload = {
+    style: 'unknown',
+    tableKeys: [],
+    literalValues: [],
+    variableRefs: [],
+    nestingDepth: 0,
+    rawSnippet: payloadStr.slice(0, 300),
+  };
+
+  const trimmed = payloadStr.trim();
+  if (!trimmed) {
+    payload.style = 'empty';
+    return payload;
+  }
+
+  if (trimmed.startsWith('{')) {
+    payload.style = 'table';
+    payload.tableKeys = extractTableKeys(trimmed);
+    payload.literalValues = extractLiterals(trimmed);
+    payload.variableRefs = extractVariableRefs(trimmed);
+    payload.nestingDepth = maxNestingDepth(trimmed);
+    return payload;
+  }
+
+  payload.style = 'positional';
+  const args = splitTopLevelArgs(trimmed);
+  for (const arg of args) {
+    const a = arg.trim();
+    if (/^["']/.test(a)) {
+      payload.literalValues.push({ type: 'string', value: a.replace(/^["']|["']$/g, '').slice(0, 80) });
+    } else if (/^\d+\.?\d*$/.test(a)) {
+      payload.literalValues.push({ type: 'number', value: parseFloat(a) });
+    } else if (/^Enum\./.test(a)) {
+      payload.literalValues.push({ type: 'enum', value: a });
+    } else if (a) {
+      payload.variableRefs.push(a.slice(0, 80));
+    }
+  }
+  return payload;
+}
+
+function extractTableKeys(text) {
+  const keys = [];
+  const keyRe = /(?:^|,)\s*(?:(\w+)\s*=|(\[\s*["']([^"']+)["']\s*\])\s*=)/gm;
+  let m;
+  while ((m = keyRe.exec(text)) !== null) {
+    const keyName = m[1] || m[3];
+    if (keyName) keys.push(keyName);
+  }
+  return keys;
+}
+
+function extractLiterals(text) {
+  const literals = [];
+  const strRe = /["']([^"']{1,80})["']/g;
+  let ms;
+  while ((ms = strRe.exec(text)) !== null) {
+    literals.push({ type: 'string', value: ms[1] });
+  }
+  const numRe = /(?<![.\w])(\d+\.?\d*)(?![.\w])/g;
+  while ((ms = numRe.exec(text)) !== null) {
+    literals.push({ type: 'number', value: parseFloat(ms[1]) });
+  }
+  if (/\btrue\b/.test(text)) literals.push({ type: 'boolean', value: true });
+  if (/\bfalse\b/.test(text)) literals.push({ type: 'boolean', value: false });
+  return literals;
+}
+
+function extractVariableRefs(text) {
+  const vars = new Set();
+  const idRe = /\b([A-Z]\w*)\b/g;
+  let m;
+  const keywords = new Set(['true', 'false', 'nil', 'Enum', 'task', 'game', 'workspace', 'script', 'math', 'string', 'table', 'os', 'Vector3', 'CFrame', 'UDim2', 'Color3', 'BrickColor']);
+  while ((m = idRe.exec(text)) !== null) {
+    if (!keywords.has(m[1])) vars.add(m[1]);
+  }
+  return [...vars];
+}
+
+function maxNestingDepth(text) {
+  let depth = 0, max = 0;
+  for (const ch of text) {
+    if (ch === '{') { depth++; if (depth > max) max = depth; }
+    else if (ch === '}') depth--;
+  }
+  return Math.max(0, max - 1);
+}
+
+function splitTopLevelArgs(text) {
+  const args = [];
+  let depth = 0, current = '';
+  for (const ch of text) {
+    if (ch === '{' || ch === '(' || ch === '[') depth++;
+    else if (ch === '}' || ch === ')' || ch === ']') depth--;
+    else if (ch === ',' && depth === 0) {
+      args.push(current);
+      current = '';
+      continue;
+    }
+    current += ch;
+  }
+  if (current.trim()) args.push(current);
+  return args;
+}
+
+// ── Luau Linting ──────────────────────────────────────────────────────────────
+
+export function lintLuauText(text, filePath = '') {
+  const lines = text.split(/\r?\n/);
+  const issues = [];
+
+  for (let i = 0; i < lines.length; i++) {
+    const line = lines[i];
+    const trimmed = line.trim();
+    if (trimmed.startsWith('--')) continue;
+
+    if (/\bwait\s*\(/.test(trimmed) && !/\btask\.wait\b/.test(trimmed)) {
+      issues.push({ line: i + 1, severity: 'warning', rule: 'deprecated-wait', message: 'Use task.wait() instead of wait().' });
+    }
+    if (/\bspawn\s*\(/.test(trimmed) && !/\btask\.spawn\b/.test(trimmed)) {
+      issues.push({ line: i + 1, severity: 'warning', rule: 'deprecated-spawn', message: 'Use task.spawn() instead of spawn().' });
+    }
+    if (/\bdelay\s*\(/.test(trimmed) && !/\btask\.delay\b/.test(trimmed)) {
+      issues.push({ line: i + 1, severity: 'warning', rule: 'deprecated-delay', message: 'Use task.delay() instead of delay().' });
+    }
+
+    const coordMatch = trimmed.match(/CFrame\.new\s*\(\s*(-?\d+\.?\d*)\s*,\s*(-?\d+\.?\d*)\s*,\s*(-?\d+\.?\d*)\s*\)/);
+    if (coordMatch) {
+      issues.push({ line: i + 1, severity: 'info', rule: 'magic-coordinates', message: `Hardcoded CFrame: (${coordMatch[1]}, ${coordMatch[2]}, ${coordMatch[3]}) — consider named constants.` });
+    }
+
+    const magicNumRe = /=\s*(\d{4,})\b/;
+    const magicNumMatch = trimmed.match(magicNumRe);
+    if (magicNumMatch && !/^\s*--/.test(trimmed)) {
+      issues.push({ line: i + 1, severity: 'info', rule: 'magic-number', message: `Large literal ${magicNumMatch[1]} — consider a named constant.` });
+    }
+
+    if (trimmed.length > 200) {
+      issues.push({ line: i + 1, severity: 'info', rule: 'long-line', message: `Line is ${trimmed.length} chars (max recommended: 200).` });
+    }
+
+    const urlMatch = trimmed.match(/https?:\/\/[^\s"')]+/g);
+    if (urlMatch) {
+      for (const url of urlMatch) {
+        if (!url.includes('github.com') && !url.includes('discord.gg') && !url.includes('dsc.gg')) {
+          issues.push({ line: i + 1, severity: 'info', rule: 'external-url', message: `External URL: ${url.slice(0, 80)} — verify it is still accessible.` });
+        }
+      }
+    }
+
+    if (/:FireServer\s*\(|:InvokeServer\s*\(/.test(trimmed) && !/\bpcall\b/.test(trimmed)) {
+      if (!isInsidePcall(lines, i)) {
+        issues.push({ line: i + 1, severity: 'warning', rule: 'unwrapped-remote', message: 'Remote call not wrapped in pcall — may error on unexpected game state.' });
+      }
+    }
+
+    if (/while\s+true\s+do/.test(trimmed)) {
+      let hasWait = false;
+      for (let j = i + 1; j < Math.min(i + 20, lines.length); j++) {
+        if (/task\.wait/.test(lines[j])) { hasWait = true; break; }
+        if (/end\s*$/.test(lines[j].trim())) break;
+      }
+      if (!hasWait) {
+        issues.push({ line: i + 1, severity: 'error', rule: 'unbounded-loop', message: 'while true do without task.wait — may freeze the executor.' });
+      }
+    }
+
+    if (/game:GetService/.test(trimmed) && i > 50) {
+      issues.push({ line: i + 1, severity: 'info', rule: 'uncached-service', message: 'game:GetService called late in file — consider caching at top.' });
+    }
+  }
+
+  const funcRanges = extractFunctionRanges(lines);
+  for (const func of funcRanges) {
+    const len = func.end - func.start;
+    if (len > 80) {
+      issues.push({ line: func.start, severity: 'info', rule: 'long-function', message: `Function "${func.name}" is ${len} lines — consider splitting.` });
+    }
+  }
+
+  const bySeverity = { error: 0, warning: 0, info: 0 };
+  for (const issue of issues) {
+    bySeverity[issue.severity] = (bySeverity[issue.severity] || 0) + 1;
+  }
+
+  return {
+    filePath: toPosix(filePath),
+    totalLines: lines.length,
+    totalIssues: issues.length,
+    bySeverity,
+    issues,
+  };
+}
+
+function isInsidePcall(lines, index) {
+  for (let i = Math.max(0, index - 10); i < index; i++) {
+    if (/\bpcall\s*\(/.test(lines[i])) return true;
+    if (/\bpcallRef\s*\(/.test(lines[i])) return true;
+  }
+  return false;
+}
+
+function extractFunctionRanges(lines) {
+  const funcs = [];
+  for (let i = 0; i < lines.length; i++) {
+    const line = lines[i];
+    const m1 = /local\s+function\s+(\w+)/.exec(line);
+    const m2 = /function\s+(\w[\w.:]*)\s*\(/.exec(line);
+    const m3 = /(\w+)\s*=\s*function\s*\(/.exec(line);
+    const name = (m1 && m1[1]) || (m2 && m2[1]) || (m3 && m3[1]);
+    if (name) {
+      funcs.push({ name, start: i + 1, end: findFunctionEnd(lines, i) });
+    }
+  }
+  return funcs;
+}
+
+function findFunctionEnd(lines, startIndex) {
+  let depth = 0;
+  let started = false;
+  for (let i = startIndex; i < lines.length; i++) {
+    const line = lines[i].trim();
+    for (const keyword of ['function', 'then', 'do']) {
+      const re = new RegExp(`\\b${keyword}\\b`, 'g');
+      while (re.exec(line)) depth++;
+    }
+    const endRe = /\bend\b/g;
+    while (endRe.exec(line)) depth--;
+    if (depth <= 0 && started) return i + 1;
+    if (depth > 0) started = true;
+  }
+  return lines.length;
+}
+
+export function scanRemotePayloads(root) {
+  const files = walkFiles(root, (filePath) => {
+    const ext = path.extname(filePath).toLowerCase();
+    return LUau_EXTENSIONS.has(ext);
+  });
+
+  const results = [];
+  for (const file of files) {
+    const text = readText(file);
+    if (!text) continue;
+    const relPath = toPosix(relative(root, file));
+    const analysis = extractRemotePayloads(text, relPath);
+    if (analysis.summary.totalCalls > 0) {
+      results.push(analysis);
+    }
+  }
+
+  return {
+    totalFiles: results.length,
+    totalCalls: results.reduce((sum, r) => sum + r.summary.totalCalls, 0),
+    files: results.map((r) => ({
+      file: r.filePath,
+      totalCalls: r.summary.totalCalls,
+      uniqueRemotes: r.summary.uniqueRemotes,
+      remoteNames: r.summary.remoteNames.slice(0, 20),
+    })),
+  };
+}
+
+export function scanLuauLint(root) {
+  const files = walkFiles(root, (filePath) => {
+    const ext = path.extname(filePath).toLowerCase();
+    return LUau_EXTENSIONS.has(ext);
+  });
+
+  const results = [];
+  let totalIssues = 0;
+  const bySeverity = { error: 0, warning: 0, info: 0 };
+
+  for (const file of files) {
+    const text = readText(file);
+    if (!text) continue;
+    const relPath = toPosix(relative(root, file));
+    const lint = lintLuauText(text, relPath);
+    if (lint.totalIssues > 0) {
+      results.push({
+        file: lint.filePath,
+        totalLines: lint.totalLines,
+        totalIssues: lint.totalIssues,
+        bySeverity: lint.bySeverity,
+        topIssues: lint.issues.slice(0, 10),
+      });
+      totalIssues += lint.totalIssues;
+      for (const [sev, count] of Object.entries(lint.bySeverity)) {
+        bySeverity[sev] = (bySeverity[sev] || 0) + count;
+      }
+    }
+  }
+
+  results.sort((a, b) => b.totalIssues - a.totalIssues);
+
+  return {
+    totalFiles: results.length,
+    totalIssues,
+    bySeverity,
+    files: results,
+  };
+}

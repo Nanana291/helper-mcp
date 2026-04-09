@@ -56,6 +56,10 @@ import {
   suggestLuauRefactor,
   scanLuauSecurity,
   scanLuauWorkspace,
+  extractRemotePayloads,
+  lintLuauText,
+  scanRemotePayloads,
+  scanLuauLint,
   bridgeLuauCommandResult,
   writeLuauHotfixSnapshots,
 } from './luau.mjs';
@@ -996,6 +1000,20 @@ const toolDefinitions = [
     },
     additionalProperties: false,
   }),
+  toolDefinition('luau.remotes', ['luau.remotes', 'luau_remotes'], 'Deep analysis of FireServer/InvokeServer calls: payload structure, table keys, literal values, variable refs. Groups by remote name.', {
+    type: 'object',
+    properties: {
+      filePath: { type: 'string', description: 'Specific file to analyze. If omitted, scans all Luau files.' },
+    },
+    additionalProperties: false,
+  }),
+  toolDefinition('luau.lint', ['luau.lint', 'luau_lint'], 'Style and best-practice linting: deprecated APIs (wait/spawn/delay), magic numbers, hardcoded coordinates, long functions, unwrapped remotes.', {
+    type: 'object',
+    properties: {
+      filePath: { type: 'string', description: 'Specific file to lint. If omitted, scans all Luau files.' },
+    },
+    additionalProperties: false,
+  }),
 ];
 
 // ── Public API ────────────────────────────────────────────────────────────────
@@ -1425,6 +1443,24 @@ export function handleTool(workspaceRoot, requestedName, args = {}) {
         label: args.label,
         record: args.record !== false,
       })));
+    }
+
+    case 'luau.remotes': {
+      if (args.filePath) {
+        const resolved = resolveFilePath(workspaceRoot, args.filePath);
+        const text = readText(resolved);
+        return textResult(jsonText(extractRemotePayloads(text, resolved)));
+      }
+      return textResult(jsonText(scanRemotePayloads(workspaceRoot)));
+    }
+
+    case 'luau.lint': {
+      if (args.filePath) {
+        const resolved = resolveFilePath(workspaceRoot, args.filePath);
+        const text = readText(resolved);
+        return textResult(jsonText(lintLuauText(text, resolved)));
+      }
+      return textResult(jsonText(scanLuauLint(workspaceRoot)));
     }
 
     case 'workspace.diff': {
