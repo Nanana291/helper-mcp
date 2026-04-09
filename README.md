@@ -106,6 +106,25 @@ Verify it was added:
 qwen mcp list
 ```
 
+## OpenCode
+
+Open the repository in OpenCode and it will pick up the local MCP server from `opencode.json`:
+
+```json
+{
+  "$schema": "https://opencode.ai/config.json",
+  "mcp": {
+    "helper-mcp": {
+      "type": "local",
+      "command": ["node", "./src/index.mjs"],
+      "enabled": true
+    }
+  }
+}
+```
+
+OpenCode will start `helper-mcp` as a local stdio server from the repo root and use the workspace-local `.helper-mcp/` store for notes, baselines, metrics, and changelogs.
+
 ## Notes
 
 - Use a trusted workspace. `helper-mcp` reads local files from the current project root.
