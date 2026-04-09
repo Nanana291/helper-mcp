@@ -3442,6 +3442,8 @@ Library:Notify({
  * Composes a natural-language explanation of what a Luau script does.
  * Uses analyzeLuauText, extractRemotePayloads, extractFlagsFromText,
  * and checkRespawnLifecycle as composition sources.
+ *
+ * Enhanced v2: confidence-scored features, ASCII data-flow diagram, severity-grouped risks.
  */
 export function explainLuauText(text, filePath = '') {
   const source = String(text || '');
@@ -3453,100 +3455,225 @@ export function explainLuauText(text, filePath = '') {
   const flags = extractFlagsFromText(text, filePath);
   const respawn = checkRespawnLifecycle(text, filePath);
 
-  // Detect UI library
+  // ── Detect UI library ────────────────────────────────────────────────────
   let uiLibrary = 'Unknown';
   if (/Library:Window\s*\(/.test(source) && /CreateDashboard\s*\(/.test(source)) {
     uiLibrary = 'LibSixtyTen';
   } else if (/Library:CreateWindow\s*\(/.test(source) || /Library:Window\s*\(/.test(source)) {
-    // Ambiguous — check for Obsidian-specific patterns
     if (/CreateDashboard/.test(source)) {
       uiLibrary = 'LibSixtyTen';
     } else if (/Library:CreateWindow/.test(source)) {
       uiLibrary = 'Obsidian';
     }
   }
-  // Fallback: check for other UI library signatures
   if (uiLibrary === 'Unknown' && /loadstring.*LibSixtyTen/.test(source)) {
     uiLibrary = 'LibSixtyTen';
   } else if (uiLibrary === 'Unknown' && /loadstring.*Obsidian/.test(source)) {
     uiLibrary = 'Obsidian';
   }
 
-  // Detect features from flag names, UI sections, function names, and comments
+  // ── Feature confidence scoring ───────────────────────────────────────────
   const allText_lower = source.toLowerCase();
+
+  // Build lookup sets from flags, function names, and UI sections
+  const flagNameSet = new Set((flags.allFlags || []).map(f => f.name.toLowerCase()));
+
+  const funcNames = [];
+  const funcNameSet = new Set();
+  for (const line of lines) {
+    let m;
+    if ((m = /\blocal\s+function\s+(\w+)/.exec(line))) { funcNames.push(m[1]); funcNameSet.add(m[1].toLowerCase()); }
+    else if ((m = /\bfunction\s+(\w[\w.:]*)\s*\(/.exec(line))) { funcNames.push(m[1]); funcNameSet.add(m[1].toLowerCase()); }
+    else if ((m = /\b(\w+)\s*=\s*function\s*\(/.exec(line))) { funcNames.push(m[1]); funcNameSet.add(m[1].toLowerCase()); }
+  }
+
+  const uiSectionNames = [];
+  const uiSectionSet = new Set();
+  const sectionRe = /(?:Page|Section|Category)\s*\(\s*\{[^}]*Name\s*=\s*["']([^"']+)["']/g;
+  const simpleSectionRe = /:\s*(Page|Section|Category)\s*\(\s*["']([^"']+)["']/g;
+  let scm;
+  while ((scm = sectionRe.exec(source)) !== null) { uiSectionNames.push(scm[1]); uiSectionSet.add(scm[1].toLowerCase()); }
+  while ((scm = simpleSectionRe.exec(source)) !== null) { uiSectionNames.push(scm[2]); uiSectionSet.add(scm[2].toLowerCase()); }
+
+  // Feature keyword definitions with multiple evidence types
   const featureKeywords = [
-    { name: 'Auto Farm', patterns: ['auto.farm', 'autofarm', 'auto farm', 'farmp'] },
-    { name: 'Auto Block', patterns: ['auto.block', 'autoblock', 'auto block'] },
-    { name: 'Auto Counter', patterns: ['auto.counter', 'autocounter', 'auto counter', 'countermode'] },
-    { name: 'Auto Ultimate', patterns: ['auto.ultimate', 'autoult', 'auto ultimate'] },
-    { name: 'Auto Evasive', patterns: ['auto.evasive', 'autoevasive', 'auto evasive'] },
-    { name: 'Auto Skills', patterns: ['auto.skill', 'autoskill', 'auto skill', 'skilltouse'] },
-    { name: 'ESP', patterns: ['esp', 'highlight', 'chams', 'esp render'] },
-    { name: 'Teleport', patterns: ['teleport', 'tp to', 'tween to', 'teleportmode'] },
-    { name: 'Orbit', patterns: ['orbit', 'orbitspeed', 'orbitdist', 'orbit mode'] },
-    { name: 'Combat', patterns: ['combat', 'auto.attack', 'autoattack', 'attack mode'] },
-    { name: 'WalkSpeed', patterns: ['walkspeed', 'setws', 'set.walk'] },
-    { name: 'JumpPower', patterns: ['jumppower', 'setjp', 'set.jump'] },
-    { name: 'Settings', patterns: ['thememanager', 'savemanager', 'config', 'settings tab'] },
-    { name: 'Character Select', patterns: ['characterselect', 'change.character', 'autochangechar'] },
-    { name: 'Return to Spawn', patterns: ['returntospawn', 'return.to', 'return to spawn'] },
+    {
+      name: 'Auto Farm',
+      flagPatterns: ['auto.farm', 'autofarm', 'auto farm'],
+      funcPatterns: ['autofarm', 'farm', 'farmp'],
+      uiPatterns: ['auto farm', 'autofarm', 'farm'],
+      textPatterns: ['auto.farm', 'autofarm', 'auto farm', 'farmp'],
+    },
+    {
+      name: 'Auto Block',
+      flagPatterns: ['auto.block', 'autoblock', 'auto block'],
+      funcPatterns: ['autoblock', 'block'],
+      uiPatterns: ['auto block', 'autoblock'],
+      textPatterns: ['auto.block', 'autoblock', 'auto block'],
+    },
+    {
+      name: 'Auto Counter',
+      flagPatterns: ['auto.counter', 'autocounter', 'auto counter'],
+      funcPatterns: ['autocounter', 'counter'],
+      uiPatterns: ['auto counter', 'autocounter'],
+      textPatterns: ['auto.counter', 'autocounter', 'auto counter', 'countermode'],
+    },
+    {
+      name: 'Auto Ultimate',
+      flagPatterns: ['auto.ultimate', 'autoult', 'auto ultimate'],
+      funcPatterns: ['autoult', 'ultimate'],
+      uiPatterns: ['auto ultimate', 'autoult'],
+      textPatterns: ['auto.ultimate', 'autoult', 'auto ultimate'],
+    },
+    {
+      name: 'Auto Evasive',
+      flagPatterns: ['auto.evasive', 'autoevasive', 'auto evasive'],
+      funcPatterns: ['autoevasive', 'evasive'],
+      uiPatterns: ['auto evasive', 'autoevasive'],
+      textPatterns: ['auto.evasive', 'autoevasive', 'auto evasive'],
+    },
+    {
+      name: 'Auto Skills',
+      flagPatterns: ['auto.skill', 'autoskill', 'auto skill'],
+      funcPatterns: ['autoskill', 'skill'],
+      uiPatterns: ['auto skill', 'autoskill'],
+      textPatterns: ['auto.skill', 'autoskill', 'auto skill', 'skilltouse'],
+    },
+    {
+      name: 'ESP',
+      flagPatterns: ['esp'],
+      funcPatterns: ['esp', 'highlight', 'chams', 'esp render'],
+      uiPatterns: ['esp'],
+      textPatterns: ['esp', 'highlight', 'chams', 'esp render'],
+    },
+    {
+      name: 'Teleport',
+      flagPatterns: ['teleport', 'teleportmode', 'tp'],
+      funcPatterns: ['teleport', 'tpto', 'tween'],
+      uiPatterns: ['teleport', 'teleports'],
+      textPatterns: ['teleport', 'tp to', 'tween to', 'teleportmode'],
+    },
+    {
+      name: 'Orbit',
+      flagPatterns: ['orbit'],
+      funcPatterns: ['orbit'],
+      uiPatterns: ['orbit'],
+      textPatterns: ['orbit', 'orbitspeed', 'orbitdist', 'orbit mode'],
+    },
+    {
+      name: 'Combat',
+      flagPatterns: ['combat', 'auto.attack', 'autoattack'],
+      funcPatterns: ['combat', 'attack'],
+      uiPatterns: ['combat', 'attack'],
+      textPatterns: ['combat', 'auto.attack', 'autoattack', 'attack mode'],
+    },
+    {
+      name: 'WalkSpeed',
+      flagPatterns: ['walkspeed', 'ws'],
+      funcPatterns: ['walkspeed', 'setws'],
+      uiPatterns: ['walkspeed', 'ws'],
+      textPatterns: ['walkspeed', 'setws', 'set.walk'],
+    },
+    {
+      name: 'JumpPower',
+      flagPatterns: ['jumppower', 'jp'],
+      funcPatterns: ['jumppower', 'setjp'],
+      uiPatterns: ['jumppower', 'jp'],
+      textPatterns: ['jumppower', 'setjp', 'set.jump'],
+    },
+    {
+      name: 'Settings',
+      flagPatterns: ['settings', 'theme', 'config'],
+      funcPatterns: ['thememanager', 'savemanager', 'settings'],
+      uiPatterns: ['settings', 'config'],
+      textPatterns: ['thememanager', 'savemanager', 'config', 'settings tab'],
+    },
+    {
+      name: 'Character Select',
+      flagPatterns: ['characterselect', 'change.character', 'autochangechar'],
+      funcPatterns: ['characterselect', 'changecharacter'],
+      uiPatterns: ['character select', 'characterselect'],
+      textPatterns: ['characterselect', 'change.character', 'autochangechar'],
+    },
+    {
+      name: 'Return to Spawn',
+      flagPatterns: ['returntospawn', 'return.to', 'returntosspawn'],
+      funcPatterns: ['returntospawn', 'return'],
+      uiPatterns: ['return to spawn', 'returntospawn'],
+      textPatterns: ['returntospawn', 'return.to', 'return to spawn'],
+    },
   ];
+
+  /**
+   * Score a single feature:
+   *  100 = explicit flag name + UI section + function name all match
+   *   80 = flag name + function name match  OR  flag name + UI section match
+   *   60 = only flag name match (cross-referenced from flags list)
+   *   40 = only function/comment mention (function name or text pattern, no flag)
+   *   20 = weak keyword match only (text pattern, no flag, no function, no UI)
+   */
+  function scoreFeature(feat) {
+    const inFlag = feat.flagPatterns.some(p => [...flagNameSet].some(fn => fn.includes(p.replace('.', ''))));
+    const inFunc = feat.funcPatterns.some(p => [...funcNameSet].some(fn => fn.includes(p)));
+    const inUI = feat.uiPatterns.some(p => [...uiSectionSet].some(s => s.includes(p)));
+    const inText = feat.textPatterns.some(p => allText_lower.includes(p));
+
+    const evidenceParts = [];
+    if (inFlag) {
+      const matchedFlag = (flags.allFlags || []).find(f => feat.flagPatterns.some(p => f.name.toLowerCase().includes(p.replace('.', ''))));
+      if (matchedFlag) evidenceParts.push(`flag "${matchedFlag.name}" (L${matchedFlag.line})`);
+      else evidenceParts.push('flag name match');
+    }
+    if (inFunc) {
+      const matchedFunc = funcNames.find(fn => feat.funcPatterns.some(p => fn.toLowerCase().includes(p)));
+      if (matchedFunc) evidenceParts.push(`function "${matchedFunc}"`);
+      else evidenceParts.push('function name match');
+    }
+    if (inUI) {
+      const matchedSection = uiSectionNames.find(s => feat.uiPatterns.some(p => s.toLowerCase().includes(p)));
+      if (matchedSection) evidenceParts.push(`UI section "${matchedSection}"`);
+      else evidenceParts.push('UI section match');
+    }
+    if (inText && !inFlag && !inFunc && !inUI) {
+      evidenceParts.push('text/keyword mention');
+    }
+
+    const evidence = evidenceParts.length > 0 ? evidenceParts.join(', ') : 'weak keyword match';
+
+    if (inFlag && inFunc && inUI) return { confidence: 100, evidence };
+    if ((inFlag && inFunc) || (inFlag && inUI)) return { confidence: 80, evidence };
+    if (inFlag) return { confidence: 60, evidence };
+    if (inFunc || inText) return { confidence: inFunc ? 40 : 20, evidence };
+    return null; // not detected at all
+  }
 
   const detectedFeatures = [];
   for (const feat of featureKeywords) {
-    if (feat.patterns.some(p => allText_lower.includes(p))) {
-      detectedFeatures.push(feat.name);
+    const score = scoreFeature(feat);
+    if (score) {
+      detectedFeatures.push({ name: feat.name, confidence: score.confidence, evidence: score.evidence });
     }
   }
 
-  // Also check flag names for feature hints
-  for (const flag of flags.allFlags || []) {
-    const flagLower = flag.name.toLowerCase();
-    if (flagLower.includes('farm') && !detectedFeatures.includes('Auto Farm')) detectedFeatures.push('Auto Farm');
-    if (flagLower.includes('block') && !detectedFeatures.includes('Auto Block')) detectedFeatures.push('Auto Block');
-    if (flagLower.includes('esp') && !detectedFeatures.includes('ESP')) detectedFeatures.push('ESP');
-    if (flagLower.includes('teleport') && !detectedFeatures.includes('Teleport')) detectedFeatures.push('Teleport');
-  }
+  // Sort features by confidence descending, then alphabetically
+  detectedFeatures.sort((a, b) => b.confidence - a.confidence || a.name.localeCompare(b.name));
 
-  // Detect services
+  // ── Services ─────────────────────────────────────────────────────────────
   const serviceRe = /game\s*:\s*GetService\s*\(\s*["']([^"']+)["']\s*\)/g;
   const services = new Set();
   let sm;
-  while ((sm = serviceRe.exec(source)) !== null) {
-    services.add(sm[1]);
-  }
+  while ((sm = serviceRe.exec(source)) !== null) services.add(sm[1]);
 
-  // Detect require() targets
+  // ── Modules ──────────────────────────────────────────────────────────────
   const requireRe = /require\s*\(\s*([^)]+)\s*\)/g;
   const modules = new Set();
   let rm;
-  while ((rm = requireRe.exec(source)) !== null) {
-    modules.add(rm[1].trim().slice(0, 80));
-  }
+  while ((rm = requireRe.exec(source)) !== null) modules.add(rm[1].trim().slice(0, 80));
 
-  // Detect UI sections (Pages, Sections)
-  const sectionRe = /(?:Page|Section|Category)\s*\(\s*\{[^}]*Name\s*=\s*["']([^"']+)["']/g;
-  const sections = [];
-  let scm;
-  while ((scm = sectionRe.exec(source)) !== null) {
-    sections.push(scm[1]);
-  }
+  // ── UI sections ──────────────────────────────────────────────────────────
+  const sections = [...uiSectionNames];
 
-  // Also detect simpler patterns
-  const simpleSectionRe = /:\s*(Page|Section|Category)\s*\(\s*["']([^"']+)["']/g;
-  let sscm;
-  while ((sscm = simpleSectionRe.exec(source)) !== null) {
-    if (!sections.includes(sscm[2])) sections.push(sscm[2]);
-  }
-
-  // Analyze loops
-  const loopRe = /\b(while|for|repeat)\b/g;
-  const pcallRe = /\bpcall\b/g;
-  const charCheckRe = /FindFirstChild\s*\(\s*["']HumanoidRootPart["']\s*\)|Character\s*&&|Character\s*\?\./g;
-  let loopCount = 0, loopMatch;
-  while ((loopMatch = loopRe.exec(source)) !== null) loopCount++;
-
-  // More precise: count while/for loops that are actual loop bodies
+  // ── Loops ────────────────────────────────────────────────────────────────
   const whileLoops = (source.match(/\bwhile\s+/g) || []).length;
   const forLoops = (source.match(/\bfor\s+/g) || []).length;
   const totalLoops = whileLoops + forLoops;
@@ -3556,22 +3683,124 @@ export function explainLuauText(text, filePath = '') {
   for (let i = 0; i < lines.length; i++) {
     const line = lines[i];
     if (/\bwhile\s+/.test(line) || /\bfor\s+/.test(line)) {
-      // Check next 10 lines for pcall and char check
       const loopBody = lines.slice(i, Math.min(i + 12, lines.length)).join('\n');
       if (/\bpcall\b/.test(loopBody)) pcallInLoops++;
       if (/HumanoidRootPart|Character\s*=|Character\s*&&/.test(loopBody)) charCheckInLoops++;
     }
   }
 
+  // ── Data flow diagram (ASCII) ────────────────────────────────────────────
+  // Build edges: service→function, function→remote, remote→ui
+  const edges = [];
+  const serviceList = [...services].sort();
+
+  // Infer service→function edges from common patterns
+  const funcServiceMap = {}; // funcName → serviceName
+  for (const svc of serviceList) {
+    const svcLower = svc.toLowerCase();
+    for (const fn of funcNames) {
+      const fnLower = fn.toLowerCase();
+      // Heuristic: function name contains service-related keywords
+      if (svcLower === 'players' && (fnLower.includes('player') || fnLower.includes('char') || fnLower.includes('join'))) {
+        funcServiceMap[fn] = svc;
+      } else if (svcLower === 'workspace' && (fnLower.includes('npc') || fnLower.includes('move') || fnLower.includes('teleport') || fnLower.includes('part'))) {
+        funcServiceMap[fn] = svc;
+      } else if (svcLower === 'replicatedstorage' && (fnLower.includes('remote') || fnLower.includes('fire') || fnLower.includes('invoke'))) {
+        funcServiceMap[fn] = svc;
+      } else if (svcLower === 'userinputservice' && (fnLower.includes('input') || fnLower.includes('key') || fnLower.includes('mouse'))) {
+        funcServiceMap[fn] = svc;
+      } else if (svcLower === 'runservice' && (fnLower.includes('render') || fnLower.includes('heartbeat') || fnLower.includes('loop') || fnLower.includes('frame'))) {
+        funcServiceMap[fn] = svc;
+      }
+    }
+  }
+
+  // Build function→remote edges from actual FireServer/InvokeServer calls
+  const remoteCallSites = remoteData.remotes || [];
+  // Map remote calls to the nearest enclosing function
+  const funcRemoteMap = {}; // remoteName → functionName (or 'global')
+  for (const rc of remoteCallSites) {
+    // Find the closest function definition above this line
+    let enclosingFunc = null;
+    for (let i = rc.line - 1; i >= 0; i--) {
+      const m = /\b(?:local\s+)?function\s+(\w[\w.:]*)\s*\(/.exec(lines[i]) || /\b(\w+)\s*=\s*function\s*\(/.exec(lines[i]);
+      if (m) { enclosingFunc = m[1]; break; }
+    }
+    funcRemoteMap[rc.remote] = enclosingFunc || 'global scope';
+  }
+
+  // Build remote→UI section edges
+  const remoteUiMap = {}; // remoteName → sectionName
+  // Heuristic: match remote name keywords to section names
+  for (const rc of remoteCallSites) {
+    const rcLower = rc.remote.toLowerCase();
+    for (const sec of sections) {
+      const secLower = sec.toLowerCase();
+      if (rcLower.includes('farm') && secLower.includes('farm')) remoteUiMap[rc.remote] = sec;
+      else if (rcLower.includes('teleport') && secLower.includes('teleport')) remoteUiMap[rc.remote] = sec;
+      else if (rcLower.includes('combat') && secLower.includes('combat')) remoteUiMap[rc.remote] = sec;
+      else if (rcLower.includes('block') && secLower.includes('block')) remoteUiMap[rc.remote] = sec;
+      else if (rcLower.includes('skill') && secLower.includes('skill')) remoteUiMap[rc.remote] = sec;
+      else if (rcLower.includes('esp') && secLower.includes('esp')) remoteUiMap[rc.remote] = sec;
+    }
+  }
+
+  // Assemble edges
+  for (const [fn, svc] of Object.entries(funcServiceMap)) {
+    edges.push({ from: `game.${svc}`, to: `${fn}()`, type: 'service→function' });
+  }
+  for (const [remote, fn] of Object.entries(funcRemoteMap)) {
+    edges.push({ from: `${fn}()`, to: `${remote}:FireServer/InvokeServer`, type: 'function→remote' });
+  }
+  for (const [remote, sec] of Object.entries(remoteUiMap)) {
+    edges.push({ from: `${remote}`, to: `${sec} Section`, type: 'remote→ui' });
+  }
+
+  // If no edges could be inferred, create minimal ones from raw services
+  if (edges.length === 0 && serviceList.length > 0) {
+    for (const svc of serviceList) {
+      edges.push({ from: `game.${svc}`, to: '[script logic]', type: 'service→function' });
+    }
+  }
+
+  // Build ASCII diagram
+  const separator = '─'.repeat(60);
+  const header = 'Services → [Functions] → Remotes → UI';
+  const diagramLines = [header, separator];
+  for (const edge of edges) {
+    diagramLines.push(`${edge.from.padEnd(30)} → ${edge.to}`);
+  }
+  if (edges.length === 0) {
+    diagramLines.push('(no inferable data flow edges)');
+  }
+  const diagram = diagramLines.join('\n');
+
+  // ── Risk severity breakdown ──────────────────────────────────────────────
+  const riskItems = analysis.categories.risks || [];
+  const bySeverity = { high: [], medium: [], low: [] };
+  for (const risk of riskItems) {
+    const sev = risk.severity || 'medium';
+    const label = risk.label || 'unknown';
+    const lineInfo = risk.line ? ` (L${risk.line})` : '';
+    const entry = `${label}${lineInfo}`;
+    if (sev === 'high' || sev === 'critical') bySeverity.high.push(entry);
+    else if (sev === 'medium' || sev === 'warning' || sev === 'review') bySeverity.medium.push(entry);
+    else bySeverity.low.push(entry);
+  }
+
   // Remote summary
   const remoteNames = remoteData.summary.remoteNames || [];
   const remoteCallCount = remoteData.summary.totalCalls || 0;
 
-  // Build natural language explanation
-  const featureList = detectedFeatures.length > 0 ? detectedFeatures.join(', ') : 'various game features';
-  const featureListSentence = detectedFeatures.length > 0
-    ? detectedFeatures.map(f => f.toLowerCase()).join(', ')
-    : 'various game features';
+  // ── Build natural language explanation ───────────────────────────────────
+  const highConfFeatures = detectedFeatures.filter(f => f.confidence >= 80);
+  const featureList = highConfFeatures.length > 0
+    ? highConfFeatures.map(f => f.name).join(', ')
+    : detectedFeatures.length > 0
+      ? detectedFeatures.map(f => f.name).join(', ')
+      : 'various game features';
+
+  const featureListSentence = featureList.toLowerCase();
 
   const remoteSummary = remoteCallCount > 0
     ? `${remoteCallCount} remote call(s) to ${remoteNames.slice(0, 5).join(', ')}${remoteNames.length > 5 ? ' and others' : ''}`
@@ -3583,14 +3812,14 @@ export function explainLuauText(text, filePath = '') {
       ? 'has partial respawn handling but some gaps exist'
       : 'lacks proper respawn handling — will break after character death';
 
-  const riskSummary = analysis.summary.riskCount > 0
-    ? `${analysis.summary.riskCount} risk(s) detected (deprecated APIs, unwrapped remotes, or unbounded loops)`
+  const riskSentence = analysis.summary.riskCount > 0
+    ? `${analysis.summary.riskCount} risk(s) detected: ${bySeverity.high.length} high, ${bySeverity.medium.length} medium, ${bySeverity.low.length} low`
     : 'no significant risks detected';
 
-  const explanation = `This is a ${analysis.summary.lineCount}-line ${uiLibrary} script for ${featureList}. It provides ${featureListSentence}. `
+  const explanation = `This is a ${analysis.summary.lineCount}-line ${uiLibrary} script providing ${featureListSentence}. `
     + `Remote calls: ${remoteSummary}. `
-    + `Character lifecycle: ${respawn}. `
-    + `Risks: ${riskSummary}.`;
+    + `Character lifecycle: ${respawnStatus}. `
+    + `Risks: ${riskSentence}.`;
 
   return {
     filePath: toPosix(filePath),
@@ -3616,11 +3845,16 @@ export function explainLuauText(text, filePath = '') {
         withCharCheck: charCheckInLoops,
       },
     },
+    dataFlow: {
+      diagram,
+      edges,
+    },
     risks: {
       total: analysis.summary.riskCount,
       unprotectedRemotes: analysis.categories.risks.filter(r => r.label === 'missing-pcall').length,
       orphanedConnections: respawn.findings.orphanedConnections || false,
       deprecatedApi: analysis.categories.risks.filter(r => ['wait', 'spawn', 'delay'].includes(r.label)).length,
+      bySeverity,
     },
   };
 }
@@ -3986,9 +4220,127 @@ export function simulateRespawnLifecycle(text, filePath = '') {
   if (base.findings.orphanedConnections) {
     recommendations.push('Track and disconnect connections during character death to prevent memory leaks.');
   }
+  if (base.findings.rootNullChecks === 0) {
+    recommendations.push('Add HumanoidRootPart wait before accessing it in loops.');
+  }
   if (recommendations.length === 0) {
     recommendations.push('Respawn lifecycle handling looks solid — no critical gaps detected.');
   }
+
+  // Build auto-fix snippets
+  const autoFixSnippets = [];
+
+  // Phase 'alive': no CharacterAdded handler
+  if (phases.find(p => p.phase === 'alive')?.gaps?.includes('No CharacterAdded handler registered — will not auto-rebind')) {
+    autoFixSnippets.push({
+      phase: 'alive',
+      issue: 'No CharacterAdded handler',
+      fix: [
+        'local function onCharacterAdded(char)',
+        '    -- Rebind callbacks to new character here',
+        '    print("Character added, rebinding...")',
+        'end',
+        '',
+        'localPlr.CharacterAdded:Connect(onCharacterAdded)',
+      ].join('\n'),
+      description: 'Add a CharacterAdded:Connect handler to auto-rebind after respawn.',
+    });
+  }
+
+  // Phase 'rebinding': Character variable not updated
+  if (phases.find(p => p.phase === 'rebinding')?.gaps?.includes('CharacterAdded handler exists but Character variable may not be updated')) {
+    autoFixSnippets.push({
+      phase: 'rebinding',
+      issue: 'Character variable not updated',
+      fix: [
+        'local function onCharacterAdded(char)',
+        '    Character = char  -- Update the Character variable',
+        '    -- Rebind other callbacks here',
+        'end',
+        '',
+        'localPlr.CharacterAdded:Connect(onCharacterAdded)',
+      ].join('\n'),
+      description: 'Update Character = char inside the CharacterAdded handler to rebind the variable.',
+    });
+  }
+
+  // Phase 'active': loops without guard
+  if (loopAnalysis.withoutGuard > 0) {
+    autoFixSnippets.push({
+      phase: 'active',
+      issue: `${loopAnalysis.withoutGuard} loop(s) without character guard`,
+      fix: [
+        'while taskRunning do',
+        '    if not Character or not Character:FindFirstChild("HumanoidRootPart") then',
+        '        task.wait(0.1)',
+        '        continue',
+        '    end',
+        '    local hrp = Character.HumanoidRootPart',
+        '    -- loop body continues here',
+        '    task.wait(0.1)',
+        'end',
+      ].join('\n'),
+      description: 'Add character guard at the start of each loop to skip iteration when Character is nil.',
+    });
+  }
+
+  // Phase 'active': remote calls without char check
+  if (remoteAnalysis.wouldFailWithoutChar > 0) {
+    autoFixSnippets.push({
+      phase: 'active',
+      issue: `${remoteAnalysis.wouldFailWithoutChar} remote call(s) without character guard`,
+      fix: [
+        'if Character and Character:FindFirstChild("HumanoidRootPart") then',
+        '    local hrp = Character.HumanoidRootPart',
+        '    pcall(function()',
+        '        Remote:FireServer(hrp.CFrame)',
+        '    end)',
+        'end',
+      ].join('\n'),
+      description: 'Wrap character-dependent remote calls in a character existence check.',
+    });
+  }
+
+  // Orphaned connections
+  if (base.findings.orphanedConnections) {
+    autoFixSnippets.push({
+      phase: 'connections',
+      issue: 'Orphaned connections without cleanup',
+      fix: [
+        'local connections = {}',
+        '',
+        '-- Instead of: signal:Connect(fn)',
+        '-- Use:',
+        'table.insert(connections, signal:Connect(function()',
+        '    -- handler body',
+        'end))',
+        '',
+        '-- Cleanup on respawn or script end:',
+        'for _, conn in ipairs(connections) do',
+        '    if typeof(conn) == "RBXScriptConnection" then',
+        '        conn:Disconnect()',
+        '    end',
+        'end',
+        'table.clear(connections)',
+      ].join('\n'),
+      description: 'Track all connections in a table and disconnect them during cleanup.',
+    });
+  }
+
+  // No root null checks
+  if (base.findings.rootNullChecks === 0 && /Character/.test(source)) {
+    autoFixSnippets.push({
+      phase: 'active',
+      issue: 'No HumanoidRootPart wait pattern',
+      fix: 'local hrp = Character:WaitForChild("HumanoidRootPart", 10)',
+      description: 'Use WaitForChild to safely acquire HumanoidRootPart before use.',
+    });
+  }
+
+  const autoFix = {
+    available: autoFixSnippets.length,
+    snippets: autoFixSnippets,
+  };
 
   // Determine overall verdict
   let verdict = base.verdict;
@@ -4007,6 +4359,7 @@ export function simulateRespawnLifecycle(text, filePath = '') {
     remoteAnalysis,
     simulation,
     recommendations,
+    autoFix,
   };
 }
 
@@ -4016,6 +4369,291 @@ export function simulateRespawnLifecycle(text, filePath = '') {
  * Semantic search within a Luau file. Unlike regex, understands code structure.
  * Parses function definitions, variable assignments, remote calls, UI sections.
  */
+// ── Fuzzy Matching ───────────────────────────────────────────────────────────
+
+/**
+ * Compute a fuzzy match score between a query string and a code identifier.
+ * Returns 0-100, where 0 means no meaningful match.
+ */
+function fuzzyMatchScore(query, name) {
+  if (!query || !name) return 0;
+  const q = query.toLowerCase();
+  const n = name.toLowerCase();
+
+  // Exact match = 100
+  if (n === q) return 100;
+
+  // Substring match (either direction) = 60
+  if (n.includes(q) || q.includes(n)) return 60;
+
+  // CamelCase word partial: split name on camel boundaries, check if any word contains query
+  const camelWords = name.split(/(?=[A-Z])/).map(w => w.toLowerCase());
+  let bestCamel = 0;
+  for (const cw of camelWords) {
+    if (cw === q) { bestCamel = 100; break; }
+    if (cw.includes(q) || q.includes(cw)) { bestCamel = Math.max(bestCamel, 80); }
+  }
+  if (bestCamel > 0) return bestCamel;
+
+  // Prefix match (3+ chars) = 30
+  const prefixLen = Math.min(Math.max(q.length, n.length), 4);
+  if (prefixLen >= 3 && n.substring(0, prefixLen) === q.substring(0, prefixLen)) {
+    return Math.max(30, prefixLen * 7); // scale 3→21, 4→28 → use flat 30 for consistency
+  }
+
+  // Fuzzy char sequence: all query chars appear in order in the name
+  if (fuzzySubsequence(q, n)) {
+    // Score higher if chars are contiguous
+    const density = q.length / n.length;
+    return Math.max(40, Math.round(40 + density * 20));
+  }
+
+  // Levenshtein distance <= 2 for short names (<= 12 chars) = 50
+  if (n.length <= 12) {
+    const dist = levenshteinDistance(q, n);
+    if (dist <= 2) return 50;
+  }
+
+  return 0;
+}
+
+/**
+ * Check if all characters of `sub` appear in order within `str`.
+ */
+function fuzzySubsequence(sub, str) {
+  let si = 0;
+  for (let i = 0; i < str.length && si < sub.length; i++) {
+    if (str[i] === sub[si]) si++;
+  }
+  return si === sub.length;
+}
+
+/**
+ * Compute Levenshtein edit distance between two strings.
+ */
+function levenshteinDistance(a, b) {
+  const m = a.length;
+  const n = b.length;
+  // For very short strings, use the simple matrix approach
+  const dp = Array.from({ length: m + 1 }, () => new Array(n + 1).fill(0));
+  for (let i = 0; i <= m; i++) dp[i][0] = i;
+  for (let j = 0; j <= n; j++) dp[0][j] = j;
+  for (let i = 1; i <= m; i++) {
+    for (let j = 1; j <= n; j++) {
+      const cost = a[i - 1] === b[j - 1] ? 0 : 1;
+      dp[i][j] = Math.min(dp[i - 1][j] + 1, dp[i][j - 1] + 1, dp[i - 1][j - 1] + cost);
+    }
+  }
+  return dp[m][n];
+}
+
+// ── Remote Reference Tracking ────────────────────────────────────────────────
+
+/**
+ * Given an index of remote calls, find all lines referencing the SAME remote
+ * name and check pcall protection.
+ */
+function buildRemoteRefMap(lines, remoteName) {
+  if (!remoteName) return null;
+  const escaped = remoteName.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+  // Match lines that reference this remote name and a FireServer/InvokeServer/etc call
+  const refRe = new RegExp(`${escaped}\\s*:\\s*(FireServer|InvokeServer|FireClient|InvokeClient)\\s*\\(`);
+  const pcallContextRe = /(?:local\s+\w+\s*=\s*)?pcall\s*\(/;
+
+  const refLines = [];
+  let withPcall = 0;
+  let withoutPcall = 0;
+
+  for (let i = 0; i < lines.length; i++) {
+    if (refRe.test(lines[i])) {
+      const lineNum = i + 1;
+      let hasPcall = false;
+
+      // Check same line
+      if (pcallContextRe.test(lines[i])) {
+        hasPcall = true;
+      } else {
+        // Check up to 3 lines before for pcall wrapping
+        for (let j = Math.max(0, i - 3); j < i; j++) {
+          if (pcallContextRe.test(lines[j])) {
+            hasPcall = true;
+            break;
+          }
+        }
+      }
+
+      if (hasPcall) withPcall++;
+      else withoutPcall++;
+      refLines.push(lineNum);
+    }
+  }
+
+  if (refLines.length === 0) return null;
+
+  return {
+    remoteName,
+    totalRefs: refLines.length,
+    withPcall,
+    withoutPcall,
+    lines: refLines,
+  };
+}
+
+// ── Cross-File Index Builder ─────────────────────────────────────────────────
+
+/**
+ * Build a keyword set from the query to quickly skip files that have zero
+ * chance of matching.  We extract all alpha tokens >= 3 chars.
+ */
+function buildQueryKeywords(queryStr) {
+  const tokens = new Set();
+  const raw = queryStr.replace(/[^a-zA-Z0-9_]+/g, ' ');
+  for (const part of raw.split(/\s+/)) {
+    if (part.length >= 3) tokens.add(part.toLowerCase());
+    // Also split camelCase
+    const camelParts = part.split(/(?=[A-Z])/);
+    if (camelParts.length > 1) {
+      for (const cp of camelParts) {
+        if (cp.length >= 3) tokens.add(cp.toLowerCase());
+      }
+    }
+  }
+  return tokens;
+}
+
+/**
+ * Check if a file's text contains at least one query keyword.
+ */
+function fileHasKeyword(text, keywords) {
+  if (keywords.size === 0) return true;
+  const lower = text.toLowerCase();
+  for (const kw of keywords) {
+    if (lower.includes(kw)) return true;
+  }
+  return false;
+}
+
+/**
+ * Analyze a single file's text and return scored matches (same logic as the
+ * single-file path, but reused for cross-file search).
+ */
+function analyzeFileMatches(text, filePath, queryStr, queryTokens, options) {
+  const lines = text.split(/\r?\n/);
+  const contextLines = options.context || 2;
+
+  // Build mini-index
+  const index = { functions: [], variables: [], remotes: [], uiSections: [], comments: [], keywords: [] };
+
+  for (let i = 0; i < lines.length; i++) {
+    const line = lines[i];
+    const lineNum = i + 1;
+
+    const fnMatch = /(?:local\s+function|function)\s+([\w.:]+)\s*\(/.exec(line) || /(\w+)\s*=\s*function\s*\(/.exec(line);
+    if (fnMatch) index.functions.push({ name: fnMatch[1], line: lineNum });
+
+    const localMatch = /local\s+(\w+)\s*=/.exec(line);
+    if (localMatch) index.variables.push({ name: localMatch[1], line: lineNum });
+
+    const remoteMatch = /(\w[\w.]*)\s*:\s*(FireServer|InvokeServer|FireClient|InvokeClient)\s*\(/.exec(line);
+    if (remoteMatch) index.remotes.push({ name: remoteMatch[1], line: lineNum, method: remoteMatch[2] });
+
+    const uiMatch = /:\s*(Page|Section|Category|Toggle|Button|Slider|Dropdown|Paragraph|Label)\s*\(/.exec(line);
+    if (uiMatch) {
+      const nameMatch = /Name\s*=\s*["']([^"']+)["']/.exec(line);
+      index.uiSections.push({ name: nameMatch ? nameMatch[1] : '?', line: lineNum, type: uiMatch[1] });
+    }
+
+    const commentMatch = /^\s*--\s*(.+)$/.exec(line);
+    if (commentMatch) index.comments.push({ text: commentMatch[1].trim(), line: lineNum });
+
+    const svcMatch = /game\s*:\s*GetService\s*\(\s*["']([^"']+)["']/.exec(line);
+    if (svcMatch) index.keywords.push({ type: 'service', text: svcMatch[0], line: lineNum });
+    if (/require\s*\(/.test(line)) index.keywords.push({ type: 'require', text: line.trim().slice(0, 80), line: lineNum });
+    if (/\b(while|for|repeat)\s+\w+/.test(line)) index.keywords.push({ type: 'loop', text: line.trim().slice(0, 80), line: lineNum });
+  }
+
+  const matches = [];
+  const maxResults = options.maxResults || 50;
+  const fuzzy = options.fuzzy !== false; // default true
+
+  function scoreElement(elementName) {
+    if (!elementName || !queryStr) return 0;
+    const fuzzyScore = fuzzyMatchScore(queryStr, elementName);
+
+    // Legacy scoring for compatibility
+    const nameLower = elementName.toLowerCase();
+    const queryLower = queryStr.toLowerCase();
+    let legacyScore = 0;
+    if (nameLower === queryLower) legacyScore = 100;
+    else if (nameLower.includes(queryLower) || queryLower.includes(nameLower)) legacyScore = 50;
+    else {
+      for (const token of queryTokens) {
+        if (nameLower === token) { legacyScore = Math.max(legacyScore, 100); continue; }
+        if (nameLower.includes(token)) { legacyScore = Math.max(legacyScore, 50); continue; }
+        if (token.includes(nameLower)) { legacyScore = Math.max(legacyScore, 50); }
+      }
+    }
+
+    // Use the higher of fuzzy and legacy
+    return Math.max(fuzzyScore, legacyScore);
+  }
+
+  function getContext(lineNum) {
+    const idx = lineNum - 1;
+    const before = [];
+    for (let i = Math.max(0, idx - contextLines); i < idx; i++) before.push(lines[i]);
+    const after = [];
+    for (let i = idx + 1; i < Math.min(lines.length, idx + 1 + contextLines); i++) after.push(lines[i]);
+    return { before, line: lines[idx] || '', after };
+  }
+
+  function addMatches(items, type) {
+    for (const item of items) {
+      const score = scoreElement(item.name);
+      if (score > 0) {
+        const entry = { type, name: item.name, line: item.line, score, context: getContext(item.line) };
+        if (fuzzy) {
+          entry.fuzzyScore = fuzzyMatchScore(queryStr, item.name);
+        }
+        matches.push(entry);
+      }
+    }
+  }
+
+  addMatches(index.functions, 'function');
+  addMatches(index.variables, 'variable');
+  addMatches(index.remotes, 'remote');
+  addMatches(index.uiSections, 'ui_section');
+
+  for (const c of index.comments) {
+    const score = scoreElement(c.text);
+    if (score > 0) {
+      const entry = { type: 'comment', name: c.text.slice(0, 60), line: c.line, score, context: getContext(c.line) };
+      if (fuzzy) entry.fuzzyScore = fuzzyMatchScore(queryStr, c.text);
+      matches.push(entry);
+    }
+  }
+
+  for (const k of index.keywords) {
+    const score = scoreElement(k.text);
+    if (score > 0) {
+      const entry = { type: 'keyword', name: k.text.slice(0, 60), line: k.line, score, context: getContext(k.line) };
+      if (fuzzy) entry.fuzzyScore = fuzzyMatchScore(queryStr, k.text);
+      matches.push(entry);
+    }
+  }
+
+  matches.sort((a, b) => b.score - a.score || a.line - b.line);
+
+  return {
+    matches: matches.slice(0, maxResults),
+    index,
+    lines,
+  };
+}
+
+// ── Main Export: semanticLuauSearch ──────────────────────────────────────────
+
 export function semanticLuauSearch(text, filePath, query, options = {}) {
   const source = String(text || '');
   const lines = source.split(/\r?\n/);
@@ -4070,46 +4708,38 @@ export function semanticLuauSearch(text, filePath, query, options = {}) {
   const queryTokens = queryStr
     .split(/[\s_-]+/)
     .flatMap(token => {
-      // Also split camelCase tokens
       const camelSplit = token.split(/(?=[A-Z])/);
       return camelSplit.length > 1 ? camelSplit.map(t => t.toLowerCase()) : [token.toLowerCase()];
     })
     .filter(t => t.length > 0);
 
   const matches = [];
+  const fuzzy = options.fuzzy !== false; // default true
 
-  function scoreMatch(elementName, elementType) {
+  function scoreElement(elementName) {
     if (!elementName || !queryStr) return 0;
+
+    if (fuzzy) {
+      return fuzzyMatchScore(queryStr, elementName);
+    }
+
+    // Legacy non-fuzzy scoring
     const nameLower = elementName.toLowerCase();
     const queryLower = queryStr.toLowerCase();
-
-    // Exact match = 100
     if (nameLower === queryLower) return 100;
+    if (nameLower.includes(queryLower) || queryLower.includes(nameLower)) return 50;
 
-    // Substring match = 50
-    if (nameLower.includes(queryLower)) return 50;
-    if (queryLower.includes(nameLower)) return 50;
-
-    // Token-based scoring
-    let tokenScore = 0;
     let maxTokenScore = 0;
     for (const token of queryTokens) {
-      // Exact token match in name
       if (nameLower === token) { maxTokenScore = Math.max(maxTokenScore, 100); continue; }
-      // Token is substring of name
       if (nameLower.includes(token)) { maxTokenScore = Math.max(maxTokenScore, 50); continue; }
-      // Name is substring of token
       if (token.includes(nameLower)) { maxTokenScore = Math.max(maxTokenScore, 50); continue; }
-      // CamelCase word match
       const camelWords = nameLower.split(/(?=[A-Z])/);
       for (const cw of camelWords) {
-        if (cw.includes(token) || token.includes(cw)) {
-          maxTokenScore = Math.max(maxTokenScore, 75);
-        }
+        if (cw.includes(token) || token.includes(cw)) maxTokenScore = Math.max(maxTokenScore, 75);
       }
     }
 
-    // Partial substring overlap bonus (bounded: max 3-char prefix match)
     if (maxTokenScore === 0) {
       for (const token of queryTokens) {
         const prefixLen = Math.min(4, token.length, nameLower.length);
@@ -4126,72 +4756,59 @@ export function semanticLuauSearch(text, filePath, query, options = {}) {
   function getContext(lineNum) {
     const idx = lineNum - 1;
     const before = [];
-    for (let i = Math.max(0, idx - contextLines); i < idx; i++) {
-      before.push(lines[i]);
-    }
+    for (let i = Math.max(0, idx - contextLines); i < idx; i++) before.push(lines[i]);
     const after = [];
-    for (let i = idx + 1; i < Math.min(lines.length, idx + 1 + contextLines); i++) {
-      after.push(lines[i]);
-    }
+    for (let i = idx + 1; i < Math.min(lines.length, idx + 1 + contextLines); i++) after.push(lines[i]);
     return { before, line: lines[idx] || '', after };
   }
 
-  // Score functions
-  for (const fn of index.functions) {
-    const score = scoreMatch(fn.name, 'function');
-    if (score > 0) {
-      matches.push({ type: 'function', name: fn.name, line: fn.line, score, context: getContext(fn.line) });
+  function addMatches(items, type) {
+    for (const item of items) {
+      const score = scoreElement(item.name);
+      if (score > 0) {
+        const entry = { type, name: item.name, line: item.line, score, context: getContext(item.line) };
+        if (fuzzy) {
+          entry.fuzzyScore = fuzzyMatchScore(queryStr, item.name);
+        }
+        matches.push(entry);
+      }
     }
   }
 
-  // Score variables
-  for (const v of index.variables) {
-    const score = scoreMatch(v.name, 'variable');
-    if (score > 0) {
-      matches.push({ type: 'variable', name: v.name, line: v.line, score, context: getContext(v.line) });
-    }
-  }
+  addMatches(index.functions, 'function');
+  addMatches(index.variables, 'variable');
+  addMatches(index.remotes, 'remote');
+  addMatches(index.uiSections, 'ui_section');
 
-  // Score remotes
-  for (const r of index.remotes) {
-    const score = scoreMatch(r.name, 'remote');
-    if (score > 0) {
-      matches.push({ type: 'remote', name: r.name, line: r.line, score, context: getContext(r.line) });
-    }
-  }
-
-  // Score UI sections
-  for (const s of index.uiSections) {
-    const score = scoreMatch(s.name, 'ui_section');
-    if (score > 0) {
-      matches.push({ type: 'ui_section', name: s.name, line: s.line, score, context: getContext(s.line) });
-    }
-  }
-
-  // Score comments (search comment text)
   for (const c of index.comments) {
-    const score = scoreMatch(c.text, 'comment');
+    const score = scoreElement(c.text);
     if (score > 0) {
-      matches.push({ type: 'comment', name: c.text.slice(0, 60), line: c.line, score, context: getContext(c.line) });
+      const entry = { type: 'comment', name: c.text.slice(0, 60), line: c.line, score, context: getContext(c.line) };
+      if (fuzzy) entry.fuzzyScore = fuzzyMatchScore(queryStr, c.text);
+      matches.push(entry);
     }
   }
 
-  // Score keywords
   for (const k of index.keywords) {
-    const score = scoreMatch(k.text, 'keyword');
+    const score = scoreElement(k.text);
     if (score > 0) {
-      matches.push({ type: 'keyword', name: k.text.slice(0, 60), line: k.line, score, context: getContext(k.line) });
+      const entry = { type: 'keyword', name: k.text.slice(0, 60), line: k.line, score, context: getContext(k.line) };
+      if (fuzzy) entry.fuzzyScore = fuzzyMatchScore(queryStr, k.text);
+      matches.push(entry);
     }
   }
 
   // Sort by score descending
   matches.sort((a, b) => b.score - a.score || a.line - b.line);
 
-  return {
+  const maxResults = options.maxResults || 50;
+
+  // Build result
+  const result = {
     filePath: toPosix(filePath),
     query: queryStr,
     totalMatches: matches.length,
-    matches: matches.slice(0, options.maxResults || 50),
+    matches: matches.slice(0, maxResults),
     index: {
       functionCount: index.functions.length,
       variableCount: index.variables.length,
@@ -4199,6 +4816,87 @@ export function semanticLuauSearch(text, filePath, query, options = {}) {
       uiSectionCount: index.uiSections.length,
     },
   };
+
+  // Remote reference tracking: if a remote name was matched, track all refs
+  const matchedRemoteNames = new Set();
+  for (const m of matches) {
+    if (m.type === 'remote') {
+      matchedRemoteNames.add(m.name);
+    }
+  }
+
+  if (matchedRemoteNames.size > 0) {
+    // Use the highest-scoring remote for tracking
+    const bestRemoteMatch = matches.find(m => m.type === 'remote');
+    if (bestRemoteMatch) {
+      const refs = buildRemoteRefMap(lines, bestRemoteMatch.name);
+      if (refs) result.remoteRefs = refs;
+    }
+  }
+
+  // Cross-file search
+  if (options.crossFile && options.root) {
+    const root = options.root;
+    const keywords = buildQueryKeywords(queryStr);
+    const crossFileResults = [];
+    let totalCrossMatches = 0;
+
+    try {
+      const luauFiles = walkFiles(root, (fp) => {
+        const ext = path.extname(fp).toLowerCase();
+        return ext === '.lua' || ext === '.luau';
+      });
+
+      for (const fp of luauFiles) {
+        // Skip the original file
+        const resolvedFp = path.isAbsolute(fp) ? fp : path.join(root, fp);
+        if (resolvedFp === path.resolve(filePath) || toPosix(relative(root, resolvedFp)) === toPosix(relative(root, path.resolve(filePath)))) {
+          continue;
+        }
+
+        const fileText = readText(resolvedFp);
+        if (!fileHasKeyword(fileText, keywords)) continue;
+
+        const fileResult = analyzeFileMatches(fileText, resolvedFp, queryStr, queryTokens, options);
+        if (fileResult.matches.length === 0) continue;
+
+        const bestScore = fileResult.matches.length > 0 ? fileResult.matches[0].score : 0;
+        crossFileResults.push({
+          filePath: toPosix(relative(root, resolvedFp)),
+          matchCount: fileResult.matches.length,
+          bestScore,
+          matches: fileResult.matches,
+        });
+        totalCrossMatches += fileResult.matches.length;
+      }
+    } catch {
+      // If cross-file search fails (permissions, etc.), silently skip
+    }
+
+    // Sort files by best score
+    crossFileResults.sort((a, b) => b.bestScore - a.bestScore);
+
+    result.crossFile = {
+      fileCount: crossFileResults.length > 0
+        ? (() => {
+            // Count total .lua/.luau files scanned
+            try {
+              return walkFiles(root, (fp) => {
+                const ext = path.extname(fp).toLowerCase();
+                return ext === '.lua' || ext === '.luau';
+              }).length;
+            } catch {
+              return 0;
+            }
+          })()
+        : 0,
+      filesWithMatches: crossFileResults.length,
+      totalMatches: totalCrossMatches,
+      files: crossFileResults,
+    };
+  }
+
+  return result;
 }
 
 // ── Extract Remote Details (Calls + Handlers) ────────────────────────────────

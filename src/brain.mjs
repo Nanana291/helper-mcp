@@ -1245,6 +1245,112 @@ export function brainFindingStats(root) {
   };
 }
 
+// ── Game Name Detection ─────────────────────────────────────────────────────
+
+function detectGameName(root) {
+  // Strategy 1: File name patterns (e.g., AnimeLastStand.lua)
+  try {
+    const luauFiles = walkFiles(root, (fp) => {
+      const ext = path.extname(fp).toLowerCase();
+      return ext === '.lua' || ext === '.luau';
+    });
+    // Look for common naming patterns in filenames
+    for (const fp of luauFiles) {
+      const basename = path.basename(fp);
+      // Skip if it looks generic
+      if (/^(utils?|helper|lib|module|config|main|init|index|common|shared)\.lua$/i.test(basename)) continue;
+      const stem = basename.replace(/\.(lua|luau)$/i, '');
+      // Remove common suffixes
+      const cleanStem = stem.replace(/(Script|Main|Loader|Init|Hub|V\d+)$/i, '').trim();
+      if (cleanStem.length >= 3) {
+        // Split camelCase to humanize
+        const spaced = cleanStem.replace(/([a-z])([A-Z])/g, '$1 $2');
+        return spaced.trim() || cleanStem;
+      }
+    }
+  } catch {
+    // Skip if walk fails
+  }
+
+  // Strategy 2: Scan first 30 lines of each .lua file for comment patterns
+  try {
+    const luauFiles = walkFiles(root, (fp) => {
+      const ext = path.extname(fp).toLowerCase();
+      return ext === '.lua' || ext === '.luau';
+    });
+    const gamePatterns = [
+      /--\s*(?:Script|Script for|Game|Exploit|Hub)[:\s]+(.+)/i,
+      /--\s*\[(.+?)\]/i,
+      /--\s*Game:\s*(.+)/i,
+      /--\s*Target:\s*(.+)/i,
+      /--\s*Exploit for[:\s]+(.+)/i,
+    ];
+    for (const fp of luauFiles) {
+      try {
+        const content = readText(fp);
+        const firstLines = content.split(/\r?\n/).slice(0, 30);
+        for (const line of firstLines) {
+          for (const pat of gamePatterns) {
+            const m = pat.exec(line);
+            if (m) {
+              const name = m[1].trim().replace(/['"\s]+$/g, '');
+              if (name.length >= 2) return name;
+            }
+          }
+        }
+      } catch {
+        // Skip unreadable files
+      }
+    }
+  } catch {
+    // Skip if walk fails
+  }
+
+  // Strategy 3: Use root folder name
+  try {
+    const folderName = path.basename(root);
+    if (folderName && folderName !== '.' && !/^\./.test(folderName) && folderName.length >= 2) {
+      return folderName.replace(/[-_]/g, ' ').trim();
+    }
+  } catch {
+    // Skip
+  }
+
+  return 'unknown';
+}
+
+function isResultIncremental(result, lastRunAt) {
+  // Check if data has a timestamp field
+  if (result.data && result.data.timestamp) {
+    try {
+      const resultTime = new Date(result.data.timestamp).getTime();
+      const cutoffTime = new Date(lastRunAt).getTime();
+      if (Number.isFinite(resultTime) && Number.isFinite(cutoffTime)) {
+        return resultTime > cutoffTime;
+      }
+    } catch {
+      // Fall through to file-based check
+    }
+  }
+  // Check file modification time
+  if (result.filePath) {
+    try {
+      const stat = fs.statSync(result.filePath);
+      if (stat.mtime) {
+        const fileTime = stat.mtime.getTime();
+        const cutoffTime = new Date(lastRunAt).getTime();
+        if (Number.isFinite(fileTime) && Number.isFinite(cutoffTime)) {
+          return fileTime > cutoffTime;
+        }
+      }
+    } catch {
+      // Skip if file doesn't exist or stat fails
+    }
+  }
+  // If we can't determine, include it (conservative)
+  return true;
+}
+
 // ── Auto-Capture from Analysis ───────────────────────────────────────────────
 
 function buildTitleFromAnalysis(result) {
@@ -1365,15 +1471,23 @@ export function autoCaptureBrain(root, analysisResults, options = {}) {
     autoTags = true,
     status = 'candidate',
     autoUpdate = false,
+    incremental = false,
+    gameName = '',
+    lastRunAt = '',
+    similarityThreshold = 10,
   } = options;
 
   if (!Array.isArray(analysisResults) || analysisResults.length === 0) {
-    return { ok: true, summary: { totalProcessed: 0, created: 0, skipped: 0, updated: 0, similarityThreshold: 10 }, notes: [], brainNoteIds: [] };
+    return { ok: true, summary: { totalProcessed: 0, created: 0, skipped: 0, updated: 0, skippedIncremental: 0, similarityThreshold: 10 }, notes: [], brainNoteIds: [] };
   }
+
+  // Resolve game name
+  const resolvedGameName = gameName || detectGameName(root);
 
   const created = [];
   const skipped = [];
   const updated = [];
+  let skippedIncremental = 0;
   const brainNoteIds = [];
 
   for (const result of analysisResults) {
@@ -1387,6 +1501,19 @@ export function autoCaptureBrain(root, analysisResults, options = {}) {
       continue;
     }
 
+    // Incremental mode: skip results older than lastRunAt
+    if (incremental && lastRunAt) {
+      if (!isResultIncremental(result, lastRunAt)) {
+        skippedIncremental++;
+        skipped.push({
+          action: 'skipped',
+          title: filePath || 'unknown',
+          reason: `Result is older than lastRunAt (${lastRunAt}), skipped in incremental mode`,
+        });
+        continue;
+      }
+    }
+
     const confidence = Number(data.confidence ?? data.confidenceAverage ?? 1);
     if (!Number.isFinite(confidence) || confidence < minConfidence) {
       skipped.push({
@@ -1397,14 +1524,22 @@ export function autoCaptureBrain(root, analysisResults, options = {}) {
       continue;
     }
 
-    const title = buildTitleFromAnalysis(result);
+    let title = buildTitleFromAnalysis(result);
     const summary = buildSummaryFromAnalysis(result);
-    const tags = autoTags ? inferTagsFromAnalysis(result) : (Array.isArray(data.tags) ? data.tags : []);
+    let tags = autoTags ? inferTagsFromAnalysis(result) : (Array.isArray(data.tags) ? data.tags : []);
+
+    // When gameName is set (manually or auto-detected), adjust scope/title/tags
+    if (resolvedGameName && resolvedGameName !== 'unknown') {
+      title = `${resolvedGameName}: ${title}`;
+      if (!tags.includes(resolvedGameName.toLowerCase())) {
+        tags = [resolvedGameName.toLowerCase(), ...tags];
+      }
+    }
 
     // Check for existing similar notes
     if (skipExisting) {
       const searchResults = searchBrainNotes(root, title, { limit: 5 });
-      const similarHit = searchResults.find((hit) => hit.type === 'note' && hit.score > 10);
+      const similarHit = searchResults.find((hit) => hit.type === 'note' && hit.score > similarityThreshold);
 
       if (similarHit) {
         if (autoUpdate) {
@@ -1437,18 +1572,19 @@ export function autoCaptureBrain(root, analysisResults, options = {}) {
           skipped.push({
             action: 'skipped',
             title,
-            reason: `Similar note exists with score ${similarHit.score} (threshold: 10), autoUpdate is false`,
+            reason: `Similar note exists with score ${similarHit.score} (threshold: ${similarityThreshold}), autoUpdate is false`,
           });
         }
         continue;
       }
     }
 
-    // Create new note
+    // Create new note — use gameName as scope if set, otherwise type
+    const noteScope = resolvedGameName && resolvedGameName !== 'unknown' ? resolvedGameName : type;
     const snapshot = appendBrainNote(root, {
       title,
       summary,
-      scope: type,
+      scope: noteScope,
       status,
       tags,
       sourcePath: filePath || '',
@@ -1472,7 +1608,9 @@ export function autoCaptureBrain(root, analysisResults, options = {}) {
       created: created.length,
       skipped: skipped.length,
       updated: updated.length,
-      similarityThreshold: 10,
+      skippedIncremental,
+      similarityThreshold,
+      gameName: resolvedGameName,
     },
     notes: [...created, ...skipped, ...updated],
     brainNoteIds,

@@ -1097,12 +1097,16 @@ const toolDefinitions = [
     },
     additionalProperties: false,
   }),
-  toolDefinition('luau.grep', ['luau.grep', 'luau_grep'], 'Semantic search within Luau files: find functions, variables, remotes, UI sections by name with context and scoring.', {
+  toolDefinition('luau.grep', ['luau.grep', 'luau_grep'], 'Semantic search within Luau files: find functions, variables, remotes, UI sections by name with fuzzy matching, cross-file search, and remote reference tracking.', {
     type: 'object',
     properties: {
       query: { type: 'string', description: 'Search query — function name, variable, feature, etc.' },
       filePath: { type: 'string', description: 'Specific file to search. If omitted, searches all Luau files.' },
       context: { type: 'number', description: 'Lines of context before/after. Default 2.' },
+      crossFile: { type: 'boolean', description: 'Search across all Luau files. Default false.' },
+      fuzzy: { type: 'boolean', description: 'Enable fuzzy matching. Default true.' },
+      fuzzyThreshold: { type: 'number', description: 'Max Levenshtein distance for fuzzy match. Default 2.' },
+      maxResults: { type: 'number', description: 'Max matches per file. Default 50.' },
     },
     required: ['query'],
     additionalProperties: false,
@@ -1115,13 +1119,17 @@ const toolDefinitions = [
     additionalProperties: false,
   }),
   // ── New: Brain tools ───────────────────────────────────────────────────────
-  toolDefinition('brain.auto_capture', ['brain.auto_capture', 'brain_auto_capture'], 'Auto-generate brain notes from analysis results. Infers titles, tags, and severity from scan/audit/risk data.', {
+  toolDefinition('brain.auto_capture', ['brain.auto_capture', 'brain_auto_capture'], 'Auto-generate brain notes from analysis results. Supports incremental mode, game name auto-detection, and configurable similarity threshold.', {
     type: 'object',
     properties: {
       scope: { type: 'string', description: 'Scope of capture: workspace, file, or custom. Default: workspace.' },
       skipExisting: { type: 'boolean', description: 'Skip if similar note exists. Default true.' },
       minConfidence: { type: 'number', description: 'Minimum confidence threshold. Default 0.3.' },
       autoTags: { type: 'boolean', description: 'Auto-infer tags from analysis. Default true.' },
+      incremental: { type: 'boolean', description: 'Only capture results since last run. Default false.' },
+      gameName: { type: 'string', description: 'Game name for scope. Empty = auto-detect.' },
+      lastRunAt: { type: 'string', description: 'ISO timestamp for incremental mode.' },
+      similarityThreshold: { type: 'number', description: 'Min search score to consider match. Default 10.' },
     },
     additionalProperties: false,
   }),
@@ -1135,7 +1143,7 @@ const toolDefinitions = [
     additionalProperties: false,
   }),
   // ── New: Workspace tools ───────────────────────────────────────────────────
-  toolDefinition('workspace.gate', ['workspace.gate', 'workspace_gate'], 'Pre-delivery gate: 9 checks (baseline parity, risk threshold, pcall coverage, deprecated API, security, etc.). Verdict: PASS/REVIEW/BLOCKED.', {
+  toolDefinition('workspace.gate', ['workspace.gate', 'workspace_gate'], 'Pre-delivery gate: 9 checks (baseline parity, risk threshold, pcall coverage, deprecated API, security, etc.). Verdict: PASS/REVIEW/BLOCKED. Supports auto-fix mode.', {
     type: 'object',
     properties: {
       baselinePath: { type: 'string' },
@@ -1144,6 +1152,8 @@ const toolDefinitions = [
       minPcallCoverage: { type: 'number', description: 'Min pcall coverage %. Default 80.' },
       maxNewRisks: { type: 'number', description: 'Max new risks allowed. Default 3.' },
       requireBaseline: { type: 'boolean', description: 'Fail without baseline. Default false.' },
+      autoFix: { type: 'boolean', description: 'Auto-fix failed checks (deprecated API, pcall, connections). Default false.' },
+      fixable: { type: 'array', items: { type: 'string' }, description: 'Checks to auto-fix. Default: ["deprecated-api","pcall-coverage","orphaned-connections"].' },
     },
     additionalProperties: false,
   }),
@@ -1746,7 +1756,26 @@ export async function handleTool(workspaceRoot, requestedName, args = {}) {
       if (args.filePath) {
         const resolved = resolveFilePath(workspaceRoot, args.filePath);
         const text = readText(resolved);
-        return textResult(jsonText(semanticLuauSearch(text, resolved, args.query, { context: args.context || 2 })));
+        return textResult(jsonText(semanticLuauSearch(text, resolved, args.query, {
+          context: args.context || 2,
+          fuzzy: args.fuzzy !== false,
+          fuzzyThreshold: args.fuzzyThreshold || 2,
+          maxResults: args.maxResults || 50,
+        })));
+      }
+      // Cross-file search
+      if (args.crossFile) {
+        const firstFile = scanLuauWorkspace(workspaceRoot).files[0];
+        const searchPath = firstFile ? firstFile.filePath : '';
+        const result = semanticLuauSearch('', searchPath, args.query, {
+          context: args.context || 2,
+          crossFile: true,
+          root: workspaceRoot,
+          fuzzy: args.fuzzy !== false,
+          fuzzyThreshold: args.fuzzyThreshold || 2,
+          maxResults: args.maxResults || 50,
+        });
+        return textResult(jsonText(result));
       }
       // Search all files
       const scan = scanLuauWorkspace(workspaceRoot);
@@ -1754,7 +1783,12 @@ export async function handleTool(workspaceRoot, requestedName, args = {}) {
       for (const f of scan.files) {
         try {
           const text = readText(f.filePath);
-          const result = semanticLuauSearch(text, f.filePath, args.query, { context: args.context || 2 });
+          const result = semanticLuauSearch(text, f.filePath, args.query, {
+            context: args.context || 2,
+            fuzzy: args.fuzzy !== false,
+            fuzzyThreshold: args.fuzzyThreshold || 2,
+            maxResults: args.maxResults || 50,
+          });
           if (result.totalMatches > 0) allMatches.push(result);
         } catch { /* skip unreadable */ }
       }
@@ -1809,6 +1843,10 @@ export async function handleTool(workspaceRoot, requestedName, args = {}) {
         minConfidence: args.minConfidence || 0.3,
         autoTags: args.autoTags !== false,
         status: args.status || 'candidate',
+        incremental: args.incremental || false,
+        gameName: args.gameName || '',
+        lastRunAt: args.lastRunAt || '',
+        similarityThreshold: args.similarityThreshold || 10,
       });
       return textResult(jsonText(result));
     }
@@ -1827,6 +1865,8 @@ export async function handleTool(workspaceRoot, requestedName, args = {}) {
         minPcallCoverage: args.minPcallCoverage,
         maxNewRisks: args.maxNewRisks,
         requireBaseline: args.requireBaseline,
+        autoFix: args.autoFix || false,
+        fixable: args.fixable || ['deprecated-api', 'pcall-coverage', 'orphaned-connections'],
       })));
     }
 

@@ -568,6 +568,8 @@ export async function gateWorkspace(root, options = {}) {
     maxNewRisks = 3,
     requireBaseline = false,
     checks,
+    autoFix = false,
+    fixable = ['deprecated-api', 'pcall-coverage', 'orphaned-connections'],
   } = options;
 
   const resolvedTarget = targetPath
@@ -612,6 +614,139 @@ export async function gateWorkspace(root, options = {}) {
   const passed = results.filter((r) => r.pass).length;
   const infoOnly = results.filter((r) => r.severity === 'info').length;
 
+  // ── Auto-Fix Phase ──────────────────────────────────────────────────────
+  let autoFixResult = null;
+  if (autoFix) {
+    const fixes = [];
+    const filesModified = new Set();
+    const fixableSet = new Set(fixable);
+
+    // Collect per-check failed files from detail strings
+    function extractFilesFromDetail(detail) {
+      // Pattern: "path/to/file.lua:42 uses deprecated wait()" or "path/file: Connect() without..."
+      const fileRe = /([^\s:]+\.(?:lua|luau))(?::(\d+))?/g;
+      const files = [];
+      let m;
+      while ((m = fileRe.exec(detail)) !== null) {
+        const fp = path.isAbsolute(m[1]) ? m[1] : path.resolve(resolvedTarget, m[1]);
+        files.push({ file: fp, line: m[2] ? Number(m[2]) : undefined });
+      }
+      return files;
+    }
+
+    for (const result of results) {
+      if (result.pass) continue;
+      if (!fixableSet.has(result.check)) continue;
+
+      const affectedFiles = extractFilesFromDetail(result.detail);
+      if (affectedFiles.length === 0) continue;
+
+      for (const { file: absPath, line } of affectedFiles) {
+        if (!fs.existsSync(absPath)) continue;
+        let content = readText(absPath);
+        let lines = content.split(/\r?\n/);
+        let changed = false;
+        const changedLines = [];
+
+        if (result.check === 'deprecated-api') {
+          // Replace wait() -> task.wait(), spawn( -> task.spawn(, delay( -> task.delay(
+          // But NOT task.wait/task.spawn/task.delay (already correct)
+          for (let i = 0; i < lines.length; i++) {
+            const orig = lines[i];
+            let newLine = orig;
+            // wait() not preceded by task.
+            newLine = newLine.replace(/(?<!task\.)\bwait\s*\(/g, 'task.wait(');
+            // spawn( not preceded by task.
+            newLine = newLine.replace(/(?<!task\.)\bspawn\s*\(/g, 'task.spawn(');
+            // delay( not preceded by task.
+            newLine = newLine.replace(/(?<!task\.)\bdelay\s*\(/g, 'task.delay(');
+            if (newLine !== orig) {
+              changed = true;
+              changedLines.push(i + 1);
+              lines[i] = newLine;
+            }
+          }
+        } else if (result.check === 'pcall-coverage') {
+          // Wrap bare FireServer/InvokeServer in pcall
+          for (let i = 0; i < lines.length; i++) {
+            const orig = lines[i];
+            if (/:FireServer\s*\(|:InvokeServer\s*\(/.test(orig) && !/\bpcall\b/.test(orig)) {
+              const indent = orig.match(/^(\s*)/)?.[1] || '';
+              const callExpr = orig.trim();
+              // Remove trailing line if just the call
+              const newLine = `${indent}pcall(function()\n${indent}    ${callExpr}\n${indent}end)`;
+              lines[i] = newLine;
+              changed = true;
+              changedLines.push(i + 1);
+            }
+          }
+        } else if (result.check === 'orphaned-connections') {
+          // Prepend connection tracking and wrap Connect calls
+          // Find first line with a Connect() call
+          let connectLineIdx = -1;
+          for (let i = 0; i < lines.length; i++) {
+            if (/\bConnect\s*\(/.test(lines[i])) {
+              connectLineIdx = i;
+              break;
+            }
+          }
+          if (connectLineIdx >= 0) {
+            // Prepend tracking table near the top (after first block of locals)
+            let insertIdx = 0;
+            for (let i = 0; i < lines.length; i++) {
+              if (/^\s*local\s/.test(lines[i]) || /^\s*$/.test(lines[i])) {
+                insertIdx = i + 1;
+              } else {
+                break;
+              }
+            }
+            lines.splice(insertIdx, 0, 'local connections = {}');
+            changed = true;
+            changedLines.push(insertIdx + 1);
+
+            // Wrap each Connect as table.insert(connections, ...)
+            for (let i = insertIdx; i < lines.length; i++) {
+              const orig = lines[i];
+              if (/\bConnect\s*\(/.test(orig) && !/table\.insert/.test(orig)) {
+                // Transform: signal:Connect(fn) -> table.insert(connections, signal:Connect(fn))
+                const newLine = orig.replace(
+                  /(\S[\s\S]*?)\bConnect\s*\(/,
+                  (match, before) => `${before}table.insert(connections, `
+                );
+                // Add closing paren if the line ends with )
+                if (/;\s*$/.test(newLine) || /\)\s*$/.test(newLine)) {
+                  lines[i] = newLine.replace(/\)\s*;?\s*$/, '))');
+                } else {
+                  lines[i] = `${newLine})`;
+                }
+                changed = true;
+                changedLines.push(i + 1);
+              }
+            }
+          }
+        }
+
+        if (changed) {
+          const newText = `${lines.join('\n').trimEnd()}\n`;
+          writeText(absPath, newText);
+          fixes.push({
+            check: result.check,
+            file: toPosix(relative(root, absPath) || absPath),
+            fixType: result.check,
+            lines: changedLines,
+          });
+          filesModified.add(toPosix(relative(root, absPath) || absPath));
+        }
+      }
+    }
+
+    autoFixResult = {
+      applied: fixes.length,
+      fixes,
+      filesModified: [...filesModified].sort(),
+    };
+  }
+
   let verdict;
   let recommendation;
   if (blockers.length > 0) {
@@ -629,7 +764,29 @@ export async function gateWorkspace(root, options = {}) {
   const brainResult = results.find((r) => r.check === 'brain-coverage');
   const brainCoverage = brainResult?.brainCoverage ?? 0;
 
-  return {
+  // Post-fix re-run: re-scan and re-run checks if autoFix was applied
+  let postFixVerdict = null;
+  if (autoFix && autoFixResult && autoFixResult.applied > 0) {
+    const rescan = scanLuauWorkspace(resolvedTarget);
+    rescan.root = resolvedTarget;
+    const postResults = [];
+    for (const checkName of activeChecks) {
+      const fn = checkFns[checkName];
+      if (!fn) continue;
+      postResults.push(await fn());
+    }
+    const postBlockers = postResults.filter((r) => r.severity === 'blocker' && !r.pass).map((r) => r.check);
+    const postWarnings = postResults.filter((r) => r.severity === 'warning' && !r.pass).map((r) => r.check);
+    if (postBlockers.length > 0) {
+      postFixVerdict = 'BLOCKED';
+    } else if (postWarnings.length > 0) {
+      postFixVerdict = 'REVIEW';
+    } else {
+      postFixVerdict = 'PASS';
+    }
+  }
+
+  const returnObj = {
     verdict,
     summary: {
       totalChecks: results.length,
@@ -650,6 +807,15 @@ export async function gateWorkspace(root, options = {}) {
     },
     recommendation,
   };
+
+  if (autoFixResult) {
+    returnObj.autoFix = autoFixResult;
+  }
+  if (postFixVerdict !== null) {
+    returnObj.postFixVerdict = postFixVerdict;
+  }
+
+  return returnObj;
 }
 
 // ── Workspace Clone ─────────────────────────────────────────────────────────
