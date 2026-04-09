@@ -1,10 +1,12 @@
 import path from 'node:path';
 import {
   appendBrainNote,
+  autoCaptureBrain,
   buildBrainSnapshot,
   buildBrainGraph,
   brainHistory,
   brainFindingHistory,
+  compareBrainSnapshots,
   diffBrainSnapshot,
   archiveBrainNote,
   deleteBrainNote,
@@ -25,6 +27,10 @@ import {
   tagBrainNote,
   teachBrainLesson,
   updateBrainNote,
+  addBrainFinding,
+  listBrainFindings,
+  updateBrainFinding,
+  brainFindingStats,
 } from './brain.mjs';
 import {
   analyzeLuauText,
@@ -41,6 +47,8 @@ import {
   decompileLuauHeuristics,
   extractFlagsFromText,
   extractUIMap,
+  explainLuauText,
+  extractRemoteDetails,
   formatLuauAnalysis,
   formatLuauHotfix,
   generateLuauTemplate,
@@ -50,8 +58,11 @@ import {
   patternSearchLuau,
   profileLuauPerformance,
   repairLuauRisk,
+  repairLuauRiskApply,
   scoreLuauRisk,
   scoreLuauComplexity,
+  semanticLuauSearch,
+  simulateRespawnLifecycle,
   summarizeLuauSurface,
   suggestLuauRefactor,
   scanLuauSecurity,
@@ -67,6 +78,11 @@ import {
   scanRespawnChecks,
   checkExecutorCompat,
   scanExecutorCompat,
+  validateStatusParagraphs,
+  scanStatusParagraphs,
+  summarizeRisks,
+  summarizeDiff,
+  generateV2Scaffold,
   bridgeLuauCommandResult,
   writeLuauHotfixSnapshots,
 } from './luau.mjs';
@@ -74,7 +90,9 @@ import { buildConfigValidationMarkdown, saveConfigValidation, validateConfigFile
 import { captureLuauMetrics } from './metrics.mjs';
 import {
   captureWorkspaceBaseline,
+  cloneWorkspace,
   diffWorkspaceState,
+  gateWorkspace,
   generateWorkspaceChangelog,
   generateWorkspaceReleaseNotes,
   restoreWorkspaceSnapshot,
@@ -221,6 +239,9 @@ function toolAnnotations(canonicalName) {
     'luau.flags', 'luau.ui_map', 'luau.migration',
     'luau.decompile', 'luau.security_scan', 'luau.performance_profile', 'luau.dependencies', 'luau.remotes', 'luau.complexity',
     'luau.taint', 'luau.flow', 'luau.handlers', 'luau.surface', 'luau.refactor', 'luau.modulegraph', 'luau.risk_score', 'luau.diff_context',
+    'luau.explain', 'luau.respawn_simulate', 'luau.grep', 'luau.extract_remote',
+    'workspace.gate',
+    'brain.compare',
   ]);
   const readOnly = readOnlyTools.has(canonicalName);
   return {
@@ -1051,6 +1072,94 @@ const toolDefinitions = [
     },
     additionalProperties: false,
   }),
+  // ── New: Luau explain ──────────────────────────────────────────────────────
+  toolDefinition('luau.explain', ['luau.explain', 'luau_explain'], 'Natural-language explanation of what a Luau script does: features, structure, risks, character lifecycle.', {
+    type: 'object',
+    properties: {
+      filePath: { type: 'string', description: 'File to explain. If omitted, explains the largest Luau file.' },
+    },
+    additionalProperties: false,
+  }),
+  toolDefinition('luau.repair_apply', ['luau.repair_apply', 'luau_repair_apply'], 'Apply a targeted fix to a Luau file for a specific risk label. Writes the patched file to disk.', {
+    type: 'object',
+    properties: {
+      filePath: { type: 'string' },
+      riskLabel: { type: 'string', description: 'Risk to fix: missing-pcall, wait, spawn, unbounded-loop, connection-cleanup, remote-rate-limit' },
+      apply: { type: 'boolean', description: 'If false, dry-run only. Default true.' },
+    },
+    required: ['filePath', 'riskLabel'],
+    additionalProperties: false,
+  }),
+  toolDefinition('luau.respawn_simulate', ['luau.respawn_simulate', 'luau_respawn_simulate'], 'Simulate full character respawn lifecycle: death → rebind → loop recovery → remote recovery. State machine analysis.', {
+    type: 'object',
+    properties: {
+      filePath: { type: 'string', description: 'File to simulate. If omitted, scans all Luau files.' },
+    },
+    additionalProperties: false,
+  }),
+  toolDefinition('luau.grep', ['luau.grep', 'luau_grep'], 'Semantic search within Luau files: find functions, variables, remotes, UI sections by name with context and scoring.', {
+    type: 'object',
+    properties: {
+      query: { type: 'string', description: 'Search query — function name, variable, feature, etc.' },
+      filePath: { type: 'string', description: 'Specific file to search. If omitted, searches all Luau files.' },
+      context: { type: 'number', description: 'Lines of context before/after. Default 2.' },
+    },
+    required: ['query'],
+    additionalProperties: false,
+  }),
+  toolDefinition('luau.extract_remote', ['luau.extract_remote', 'luau_extract_remote'], 'Deep remote analysis: call sites, handlers, pcall coverage, orphaned remotes, payload styles.', {
+    type: 'object',
+    properties: {
+      filePath: { type: 'string', description: 'File to analyze. If omitted, scans all Luau files.' },
+    },
+    additionalProperties: false,
+  }),
+  // ── New: Brain tools ───────────────────────────────────────────────────────
+  toolDefinition('brain.auto_capture', ['brain.auto_capture', 'brain_auto_capture'], 'Auto-generate brain notes from analysis results. Infers titles, tags, and severity from scan/audit/risk data.', {
+    type: 'object',
+    properties: {
+      scope: { type: 'string', description: 'Scope of capture: workspace, file, or custom. Default: workspace.' },
+      skipExisting: { type: 'boolean', description: 'Skip if similar note exists. Default true.' },
+      minConfidence: { type: 'number', description: 'Minimum confidence threshold. Default 0.3.' },
+      autoTags: { type: 'boolean', description: 'Auto-infer tags from analysis. Default true.' },
+    },
+    additionalProperties: false,
+  }),
+  toolDefinition('brain.compare', ['brain.compare', 'brain_compare'], 'Compare two brain snapshots: added, removed, modified notes, status drift, tag trends.', {
+    type: 'object',
+    properties: {
+      snapshotA: { type: 'string' },
+      snapshotB: { type: 'string' },
+    },
+    required: ['snapshotA', 'snapshotB'],
+    additionalProperties: false,
+  }),
+  // ── New: Workspace tools ───────────────────────────────────────────────────
+  toolDefinition('workspace.gate', ['workspace.gate', 'workspace_gate'], 'Pre-delivery gate: 9 checks (baseline parity, risk threshold, pcall coverage, deprecated API, security, etc.). Verdict: PASS/REVIEW/BLOCKED.', {
+    type: 'object',
+    properties: {
+      baselinePath: { type: 'string' },
+      targetPath: { type: 'string' },
+      maxRiskDelta: { type: 'number', description: 'Max allowed risk increase. Default 5.' },
+      minPcallCoverage: { type: 'number', description: 'Min pcall coverage %. Default 80.' },
+      maxNewRisks: { type: 'number', description: 'Max new risks allowed. Default 3.' },
+      requireBaseline: { type: 'boolean', description: 'Fail without baseline. Default false.' },
+    },
+    additionalProperties: false,
+  }),
+  toolDefinition('workspace.clone', ['workspace.clone', 'workspace_clone'], 'Clone workspace files + brain state to a new directory. Preserves directory structure.', {
+    type: 'object',
+    properties: {
+      targetDir: { type: 'string' },
+      includeBrain: { type: 'boolean', description: 'Copy .helper-mcp/brain. Default true.' },
+      includeBaselines: { type: 'boolean', description: 'Copy .helper-mcp/baselines. Default true.' },
+      includeMetrics: { type: 'boolean', description: 'Copy .helper-mcp/metrics. Default true.' },
+      luauOnly: { type: 'boolean', description: 'Only copy .lua/.luau files. Default false.' },
+      fileFilter: { type: 'string', description: 'Only copy files matching this glob pattern.' },
+    },
+    required: ['targetDir'],
+    additionalProperties: false,
+  }),
 ];
 
 // ── Public API ────────────────────────────────────────────────────────────────
@@ -1130,7 +1239,7 @@ function storeMigrationBrainNote(workspaceRoot, result, oldPath, newPath, title 
   return { markdown, snapshot };
 }
 
-export function handleTool(workspaceRoot, requestedName, args = {}) {
+export async function handleTool(workspaceRoot, requestedName, args = {}) {
   const canonicalName = toolDefinitions.find((t) => t.aliases.includes(requestedName))?.canonicalName || requestedName;
 
   switch (canonicalName) {
@@ -1570,6 +1679,166 @@ export function handleTool(workspaceRoot, requestedName, args = {}) {
         snapshotPath: args.snapshotPath,
         targetPath: args.targetPath || '',
         apply: args.apply !== false,
+      })));
+    }
+
+    case 'luau.explain': {
+      if (args.filePath) {
+        const resolved = resolveFilePath(workspaceRoot, args.filePath);
+        const text = readText(resolved);
+        return textResult(jsonText(explainLuauText(text, resolved)));
+      }
+      // Auto-pick the largest Luau file
+      const scan = scanLuauWorkspace(workspaceRoot);
+      if (scan.totalFiles === 0) {
+        return textResult(jsonText({ ok: false, error: 'No Luau files found in workspace.' }));
+      }
+      const largest = scan.files.sort((a, b) => b.summary.lineCount - a.summary.lineCount)[0];
+      const text = readText(largest.filePath);
+      return textResult(jsonText(explainLuauText(text, largest.filePath)));
+    }
+
+    case 'luau.repair_apply': {
+      const resolved = resolveFilePath(workspaceRoot, args.filePath);
+      const text = readText(resolved);
+      const report = repairLuauRiskApply(text, resolved, args.riskLabel, { apply: args.apply !== false });
+      if (args.apply !== false && report.applied) {
+        writeText(resolved, `${report.newText.trimEnd()}\n`);
+      }
+      return textResult(jsonText({
+        ok: true,
+        applied: report.applied,
+        filePath: resolved,
+        riskLabel: args.riskLabel,
+        line: report.line,
+        before: report.before,
+        after: report.after,
+        explanation: report.explanation,
+      }));
+    }
+
+    case 'luau.respawn_simulate': {
+      if (args.filePath) {
+        const resolved = resolveFilePath(workspaceRoot, args.filePath);
+        const text = readText(resolved);
+        return textResult(jsonText(simulateRespawnLifecycle(text, resolved)));
+      }
+      // Scan all files
+      const scan = scanLuauWorkspace(workspaceRoot);
+      const results = scan.files.map((f) => {
+        try {
+          const text = readText(f.filePath);
+          return simulateRespawnLifecycle(text, f.filePath);
+        } catch { return null; }
+      }).filter(Boolean);
+      return textResult(jsonText({
+        totalFiles: results.length,
+        verdicts: {
+          pass: results.filter((r) => r.verdict === 'PASS').length,
+          warn: results.filter((r) => r.verdict === 'WARN').length,
+          fail: results.filter((r) => r.verdict === 'FAIL').length,
+        },
+        files: results,
+      }));
+    }
+
+    case 'luau.grep': {
+      if (args.filePath) {
+        const resolved = resolveFilePath(workspaceRoot, args.filePath);
+        const text = readText(resolved);
+        return textResult(jsonText(semanticLuauSearch(text, resolved, args.query, { context: args.context || 2 })));
+      }
+      // Search all files
+      const scan = scanLuauWorkspace(workspaceRoot);
+      const allMatches = [];
+      for (const f of scan.files) {
+        try {
+          const text = readText(f.filePath);
+          const result = semanticLuauSearch(text, f.filePath, args.query, { context: args.context || 2 });
+          if (result.totalMatches > 0) allMatches.push(result);
+        } catch { /* skip unreadable */ }
+      }
+      return textResult(jsonText({
+        query: args.query,
+        fileCount: allMatches.length,
+        totalMatches: allMatches.reduce((sum, m) => sum + m.totalMatches, 0),
+        files: allMatches,
+      }));
+    }
+
+    case 'luau.extract_remote': {
+      if (args.filePath) {
+        const resolved = resolveFilePath(workspaceRoot, args.filePath);
+        const text = readText(resolved);
+        return textResult(jsonText(extractRemoteDetails(text, resolved)));
+      }
+      // Scan all files
+      const scan = scanLuauWorkspace(workspaceRoot);
+      const allRemotes = [];
+      for (const f of scan.files) {
+        try {
+          const text = readText(f.filePath);
+          const result = extractRemoteDetails(text, f.filePath);
+          if (result.summary.totalCalls > 0) allRemotes.push(result);
+        } catch { /* skip unreadable */ }
+      }
+      return textResult(jsonText({
+        totalFiles: allRemotes.length,
+        summary: {
+          totalCalls: allRemotes.reduce((sum, r) => sum + r.summary.totalCalls, 0),
+          uniqueRemotes: allRemotes.reduce((sum, r) => sum + r.summary.uniqueRemotes, 0),
+          withPcall: allRemotes.reduce((sum, r) => sum + r.summary.withPcall, 0),
+          withoutPcall: allRemotes.reduce((sum, r) => sum + r.summary.withoutPcall, 0),
+          orphaned: allRemotes.reduce((sum, r) => sum + r.summary.orphanedRemotes, 0),
+        },
+        files: allRemotes,
+      }));
+    }
+
+    case 'brain.auto_capture': {
+      const scan = scanLuauWorkspace(workspaceRoot);
+      const analysisResults = scan.files
+        .filter((f) => f.summary.riskCount > 0 || f.summary.remoteCount > 0)
+        .map((f) => ({
+          type: f.summary.riskCount > 5 ? 'audit' : 'scan',
+          filePath: f.filePath,
+          data: { summary: f.summary, risks: f.categories.risks },
+        }));
+      const result = autoCaptureBrain(workspaceRoot, analysisResults, {
+        skipExisting: args.skipExisting !== false,
+        minConfidence: args.minConfidence || 0.3,
+        autoTags: args.autoTags !== false,
+        status: args.status || 'candidate',
+      });
+      return textResult(jsonText(result));
+    }
+
+    case 'brain.compare': {
+      const resolvedA = path.isAbsolute(args.snapshotA) ? args.snapshotA : path.resolve(workspaceRoot, args.snapshotA);
+      const resolvedB = path.isAbsolute(args.snapshotB) ? args.snapshotB : path.resolve(workspaceRoot, args.snapshotB);
+      return textResult(jsonText(compareBrainSnapshots(workspaceRoot, resolvedA, resolvedB)));
+    }
+
+    case 'workspace.gate': {
+      return textResult(jsonText(await gateWorkspace(workspaceRoot, {
+        baselinePath: args.baselinePath,
+        targetPath: args.targetPath,
+        maxRiskDelta: args.maxRiskDelta,
+        minPcallCoverage: args.minPcallCoverage,
+        maxNewRisks: args.maxNewRisks,
+        requireBaseline: args.requireBaseline,
+      })));
+    }
+
+    case 'workspace.clone': {
+      const targetDir = path.isAbsolute(args.targetDir) ? args.targetDir : path.resolve(workspaceRoot, args.targetDir);
+      return textResult(jsonText(cloneWorkspace(workspaceRoot, {
+        targetDir,
+        includeBrain: args.includeBrain !== false,
+        includeBaselines: args.includeBaselines !== false,
+        includeMetrics: args.includeMetrics !== false,
+        luauOnly: args.luauOnly || false,
+        fileFilter: args.fileFilter,
       })));
     }
 

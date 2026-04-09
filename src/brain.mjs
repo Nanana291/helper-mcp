@@ -1162,3 +1162,523 @@ export function mergeBrainNotes(root, { noteId = '', mergeIds = [], apply = fals
     counts: snapshot.counts,
   };
 }
+
+// ── Findings Tracker ─────────────────────────────────────────────────────────
+
+const FINDINGS_FILE = 'findings.jsonl';
+
+function findingsPath(root) {
+  const dir = path.join(root, STORE_DIR);
+  fs.mkdirSync(dir, { recursive: true });
+  return { dir, file: path.join(dir, FINDINGS_FILE) };
+}
+
+function loadFindings(root) {
+  const { file } = findingsPath(root);
+  if (!fs.existsSync(file)) return [];
+  return readText(file)
+    .split(/\r?\n/)
+    .map(line => { try { return JSON.parse(line); } catch { return null; } })
+    .filter(Boolean);
+}
+
+function saveFindings(root, findings) {
+  const { file } = findingsPath(root);
+  fs.writeFileSync(file, findings.map(f => JSON.stringify(f)).join('\n') + '\n', 'utf8');
+}
+
+export function addBrainFinding(root, finding) {
+  const findings = loadFindings(root);
+  const entry = {
+    id: `${Date.now()}-${Math.random().toString(16).slice(2)}`,
+    file: String(finding.file || '').trim(),
+    line: finding.line || 0,
+    severity: String(finding.severity || 'info').toLowerCase(),
+    rule: String(finding.rule || '').trim(),
+    message: String(finding.message || finding.summary || '').trim(),
+    status: 'open',
+    source: String(finding.source || 'manual').trim(),
+    createdAt: new Date().toISOString(),
+    updatedAt: new Date().toISOString(),
+  };
+  findings.push(entry);
+  saveFindings(root, findings);
+  return { ok: true, finding: entry, total: findings.length };
+}
+
+export function listBrainFindings(root, { status, severity, file, limit = 50 } = {}) {
+  let findings = loadFindings(root);
+  if (status) findings = findings.filter(f => f.status === String(status).toLowerCase());
+  if (severity) findings = findings.filter(f => f.severity === String(severity).toLowerCase());
+  if (file) findings = findings.filter(f => f.file && f.file.toLowerCase().includes(String(file).toLowerCase()));
+  return findings.slice(-Math.max(1, Number(limit) || 50));
+}
+
+export function updateBrainFinding(root, id, fields = {}) {
+  const findings = loadFindings(root);
+  const idx = findings.findIndex(f => f.id === id);
+  if (idx === -1) return { ok: false, error: `Finding not found: ${id}` };
+  const allowed = ['status', 'message', 'severity'];
+  for (const key of allowed) {
+    if (fields[key] !== undefined) findings[idx][key] = String(fields[key]).trim();
+  }
+  findings[idx].updatedAt = new Date().toISOString();
+  saveFindings(root, findings);
+  return { ok: true, finding: findings[idx] };
+}
+
+export function brainFindingStats(root) {
+  const findings = loadFindings(root);
+  const byStatus = {};
+  const bySeverity = {};
+  const byFile = {};
+  for (const f of findings) {
+    byStatus[f.status] = (byStatus[f.status] || 0) + 1;
+    bySeverity[f.severity] = (bySeverity[f.severity] || 0) + 1;
+    if (f.file) byFile[f.file] = (byFile[f.file] || 0) + 1;
+  }
+  return {
+    total: findings.length,
+    byStatus,
+    bySeverity,
+    topFiles: Object.entries(byFile).sort((a, b) => b[1] - a[1]).slice(0, 10),
+  };
+}
+
+// ── Auto-Capture from Analysis ───────────────────────────────────────────────
+
+function buildTitleFromAnalysis(result) {
+  const { type, data, filePath } = result;
+  const fileName = filePath ? path.basename(filePath) : 'unknown';
+
+  switch (type) {
+    case 'scan':
+      return `Luau scan: ${fileName} — ${data.callbackCount || 0} callbacks, ${data.remoteCount || 0} remotes, ${data.riskCount || 0} risks`;
+    case 'inspect': {
+      const keyFinding = data.keyFinding || data.finding || data.summary || 'inspection complete';
+      return `Analysis: ${fileName} — ${keyFinding}`;
+    }
+    case 'audit': {
+      const issue = data.issue || data.finding || data.summary || 'audit complete';
+      return `Audit finding: ${fileName} — ${issue}`;
+    }
+    case 'risk': {
+      const riskLabel = data.label || data.risk || data.finding || 'risk detected';
+      const line = data.line || 0;
+      return `Risk: ${fileName} — ${riskLabel} at line ${line}`;
+    }
+    case 'security': {
+      const findingLabel = data.label || data.finding || data.summary || 'security issue';
+      return `Security: ${fileName} — ${findingLabel}`;
+    }
+    case 'performance': {
+      const findingLabel = data.label || data.finding || data.summary || 'performance issue';
+      return `Performance: ${fileName} — ${findingLabel}`;
+    }
+    case 'migration': {
+      const oldName = data.oldName || data.source || 'unknown';
+      const newName = data.newName || data.target || 'unknown';
+      const verdict = data.verdict || data.status || 'migration analysis';
+      return `Migration: ${oldName} → ${newName} — ${verdict}`;
+    }
+    default:
+      return `Analysis: ${fileName} — ${data.summary || data.finding || type}`;
+  }
+}
+
+function inferTagsFromAnalysis(result) {
+  const { type, data, filePath } = result;
+  const tags = new Set();
+  const ext = filePath ? path.extname(filePath).toLowerCase() : '';
+
+  // File type tags
+  if (ext === '.lua' || ext === '.luau') {
+    tags.add('luau');
+  }
+
+  // Analysis type tag
+  if (type) {
+    tags.add(type);
+  }
+
+  // Severity tags from data
+  const severity = String(data.severity || data.riskLevel || '').toLowerCase();
+  if (severity.includes('high') || severity.includes('critical')) {
+    tags.add('high-risk');
+  } else if (severity.includes('medium') || severity.includes('moderate')) {
+    tags.add('medium-risk');
+  } else if (severity.includes('low') || severity === 'info') {
+    tags.add('low-risk');
+  }
+
+  // Structural tags from data
+  if (data.callbackCount || data.callbacks) tags.add('callbacks');
+  if (data.remoteCount || data.remotes) tags.add('remotes');
+  if (data.esp || data.espDetected) tags.add('esp');
+  if (data.ui || data.uiElements) tags.add('ui');
+  if (data.riskCount || data.risks) tags.add('risk');
+  if (data.security || data.securityIssue) tags.add('security');
+  if (data.performance || data.performanceIssue) tags.add('performance');
+
+  // Merge with any tags already in data
+  if (Array.isArray(data.tags)) {
+    for (const tag of data.tags) {
+      tags.add(String(tag).trim().toLowerCase());
+    }
+  }
+
+  // Fallback tag
+  if (tags.size === 0) {
+    tags.add('analysis');
+  }
+
+  return [...tags];
+}
+
+function buildSummaryFromAnalysis(result) {
+  const { type, data } = result;
+  const parts = [];
+
+  if (data.summary) parts.push(data.summary);
+  if (data.finding) parts.push(data.finding);
+  if (data.evidence) parts.push(data.evidence);
+  if (data.details) parts.push(data.details);
+  if (data.message) parts.push(data.message);
+
+  // Add structured info for scan types
+  if (type === 'scan') {
+    if (data.callbackCount) parts.push(`Callbacks: ${data.callbackCount}`);
+    if (data.remoteCount) parts.push(`Remotes: ${data.remoteCount}`);
+    if (data.riskCount) parts.push(`Risks: ${data.riskCount}`);
+  }
+
+  if (data.suggestedFix) parts.push(`Suggested fix: ${data.suggestedFix}`);
+  if (data.verdict) parts.push(`Verdict: ${data.verdict}`);
+
+  return parts.join('\n\n') || `${type} analysis result`;
+}
+
+export function autoCaptureBrain(root, analysisResults, options = {}) {
+  const {
+    skipExisting = true,
+    minConfidence = 0.3,
+    autoTags = true,
+    status = 'candidate',
+    autoUpdate = false,
+  } = options;
+
+  if (!Array.isArray(analysisResults) || analysisResults.length === 0) {
+    return { ok: true, summary: { totalProcessed: 0, created: 0, skipped: 0, updated: 0, similarityThreshold: 10 }, notes: [], brainNoteIds: [] };
+  }
+
+  const created = [];
+  const skipped = [];
+  const updated = [];
+  const brainNoteIds = [];
+
+  for (const result of analysisResults) {
+    const { type, data, filePath } = result;
+    if (!type || !data) {
+      skipped.push({
+        action: 'skipped',
+        title: filePath || 'unknown',
+        reason: 'Missing type or data fields',
+      });
+      continue;
+    }
+
+    const confidence = Number(data.confidence ?? data.confidenceAverage ?? 1);
+    if (!Number.isFinite(confidence) || confidence < minConfidence) {
+      skipped.push({
+        action: 'skipped',
+        title: filePath || 'unknown',
+        reason: `Confidence ${confidence} below threshold ${minConfidence}`,
+      });
+      continue;
+    }
+
+    const title = buildTitleFromAnalysis(result);
+    const summary = buildSummaryFromAnalysis(result);
+    const tags = autoTags ? inferTagsFromAnalysis(result) : (Array.isArray(data.tags) ? data.tags : []);
+
+    // Check for existing similar notes
+    if (skipExisting) {
+      const searchResults = searchBrainNotes(root, title, { limit: 5 });
+      const similarHit = searchResults.find((hit) => hit.type === 'note' && hit.score > 10);
+
+      if (similarHit) {
+        if (autoUpdate) {
+          // Update the existing note
+          const noteUpdate = {
+            title,
+            summary,
+          };
+          const updateResult = updateBrainNote(root, similarHit.id, noteUpdate);
+          if (updateResult.ok) {
+            // Also update tags if needed
+            if (autoTags && tags.length > 0) {
+              tagBrainNote(root, similarHit.id, tags);
+            }
+            updated.push({
+              action: 'updated',
+              id: similarHit.id,
+              title,
+              reason: `Updated existing similar note (score: ${similarHit.score})`,
+            });
+            brainNoteIds.push(similarHit.id);
+          } else {
+            skipped.push({
+              action: 'skipped',
+              title,
+              reason: `Similar note found (score: ${similarHit.score}) but update failed: ${updateResult.error}`,
+            });
+          }
+        } else {
+          skipped.push({
+            action: 'skipped',
+            title,
+            reason: `Similar note exists with score ${similarHit.score} (threshold: 10), autoUpdate is false`,
+          });
+        }
+        continue;
+      }
+    }
+
+    // Create new note
+    const snapshot = appendBrainNote(root, {
+      title,
+      summary,
+      scope: type,
+      status,
+      tags,
+      sourcePath: filePath || '',
+      evidence: String(data.evidence || data.text || '').trim(),
+    });
+
+    const noteId = snapshot?.notes?.at?.(-1)?.id;
+    created.push({
+      action: 'created',
+      id: noteId,
+      title,
+      reason: `New note created from ${type} analysis`,
+    });
+    if (noteId) brainNoteIds.push(noteId);
+  }
+
+  return {
+    ok: true,
+    summary: {
+      totalProcessed: analysisResults.length,
+      created: created.length,
+      skipped: skipped.length,
+      updated: updated.length,
+      similarityThreshold: 10,
+    },
+    notes: [...created, ...skipped, ...updated],
+    brainNoteIds,
+  };
+}
+
+// ── Snapshot Comparison ──────────────────────────────────────────────────────
+
+export function compareBrainSnapshots(root, snapshotPathA, snapshotPathB) {
+  const resolvedA = path.isAbsolute(snapshotPathA) ? snapshotPathA : path.resolve(root, snapshotPathA);
+  const resolvedB = path.isAbsolute(snapshotPathB) ? snapshotPathB : path.resolve(root, snapshotPathB);
+
+  // Validate snapshot files exist
+  if (!fs.existsSync(resolvedA)) {
+    return { ok: false, error: `Snapshot A not found: ${snapshotPathA}` };
+  }
+  if (!fs.existsSync(resolvedB)) {
+    return { ok: false, error: `Snapshot B not found: ${snapshotPathB}` };
+  }
+
+  // Parse snapshot files
+  let snapshotA, snapshotB;
+  try {
+    snapshotA = JSON.parse(readText(resolvedA));
+  } catch (err) {
+    return { ok: false, error: `Snapshot A is not valid JSON: ${snapshotPathA} — ${err.message}` };
+  }
+  try {
+    snapshotB = JSON.parse(readText(resolvedB));
+  } catch (err) {
+    return { ok: false, error: `Snapshot B is not valid JSON: ${snapshotPathB} — ${err.message}` };
+  }
+
+  const notesA = Array.isArray(snapshotA.notes) ? snapshotA.notes : [];
+  const notesB = Array.isArray(snapshotB.notes) ? snapshotB.notes : [];
+
+  const mapA = new Map(notesA.map((n) => [n.id, n]));
+  const mapB = new Map(notesB.map((n) => [n.id, n]));
+
+  const added = [];
+  const removed = [];
+  const modified = [];
+  let unchanged = 0;
+  let statusChanges = 0;
+  let tagChanges = 0;
+
+  // Notes in B but not in A → added
+  for (const note of notesB) {
+    if (!mapA.has(note.id)) {
+      added.push({
+        id: note.id,
+        title: note.title,
+        status: note.status || 'candidate',
+        tags: Array.isArray(note.tags) ? note.tags : [],
+        snapshot: 'b',
+      });
+    }
+  }
+
+  // Notes in A but not in B → removed
+  for (const note of notesA) {
+    if (!mapB.has(note.id)) {
+      removed.push({
+        id: note.id,
+        title: note.title,
+        status: note.status || 'candidate',
+        tags: Array.isArray(note.tags) ? note.tags : [],
+        snapshot: 'a',
+      });
+    }
+  }
+
+  // Notes in both → compare fields
+  for (const [id, noteB] of mapB) {
+    const noteA = mapA.get(id);
+    if (!noteA) continue; // already handled in added
+
+    const changes = {};
+    let hasChanges = false;
+
+    // Title comparison
+    if (noteA.title !== noteB.title) {
+      changes.title = { before: noteA.title, after: noteB.title };
+      hasChanges = true;
+    }
+
+    // Summary comparison
+    if (noteA.summary !== noteB.summary) {
+      changes.summary = { changed: true };
+      hasChanges = true;
+    }
+
+    // Status comparison
+    if (noteA.status !== noteB.status) {
+      changes.status = { before: noteA.status || 'candidate', after: noteB.status || 'candidate' };
+      hasChanges = true;
+      statusChanges++;
+    }
+
+    // Tags comparison
+    const tagsA = new Set(Array.isArray(noteA.tags) ? noteA.tags : []);
+    const tagsB = new Set(Array.isArray(noteB.tags) ? noteB.tags : []);
+    const tagsAdded = [...tagsB].filter((t) => !tagsA.has(t));
+    const tagsRemoved = [...tagsA].filter((t) => !tagsB.has(t));
+    if (tagsAdded.length > 0 || tagsRemoved.length > 0) {
+      changes.tags = { added: tagsAdded, removed: tagsRemoved };
+      hasChanges = true;
+      tagChanges++;
+    }
+
+    // Evidence comparison
+    if (noteA.evidence !== noteB.evidence) {
+      changes.evidence = { changed: true };
+      hasChanges = true;
+    }
+
+    if (hasChanges) {
+      modified.push({
+        id,
+        title: noteB.title,
+        changes,
+      });
+    } else {
+      unchanged++;
+    }
+  }
+
+  // Compute drift
+  const noteGrowth = notesB.length - notesA.length;
+
+  // Status drift: count changes in status between A and B
+  const statusDriftParts = [];
+  const statusCountA = {};
+  const statusCountB = {};
+  for (const note of notesA) {
+    const s = note.status || 'candidate';
+    statusCountA[s] = (statusCountA[s] || 0) + 1;
+  }
+  for (const note of notesB) {
+    const s = note.status || 'candidate';
+    statusCountB[s] = (statusCountB[s] || 0) + 1;
+  }
+  const allStatuses = new Set([...Object.keys(statusCountA), ...Object.keys(statusCountB)]);
+  for (const status of allStatuses) {
+    const countA = statusCountA[status] || 0;
+    const countB = statusCountB[status] || 0;
+    const diff = countB - countA;
+    if (diff !== 0) {
+      statusDriftParts.push(`${diff > 0 ? '+' : ''}${diff} ${status}`);
+    }
+  }
+  const statusDrift = statusDriftParts.length > 0 ? statusDriftParts.join(', ') : 'no change';
+
+  // Tag trends: tags that increased in B vs A
+  const tagCountA = {};
+  const tagCountB = {};
+  for (const note of notesA) {
+    for (const tag of Array.isArray(note.tags) ? note.tags : []) {
+      tagCountA[tag] = (tagCountA[tag] || 0) + 1;
+    }
+  }
+  for (const note of notesB) {
+    for (const tag of Array.isArray(note.tags) ? note.tags : []) {
+      tagCountB[tag] = (tagCountB[tag] || 0) + 1;
+    }
+  }
+  const tagTrends = {};
+  const allTags = new Set([...Object.keys(tagCountA), ...Object.keys(tagCountB)]);
+  for (const tag of allTags) {
+    const diff = (tagCountB[tag] || 0) - (tagCountA[tag] || 0);
+    if (diff !== 0) {
+      tagTrends[tag] = diff;
+    }
+  }
+
+  return {
+    snapshots: {
+      a: {
+        path: toPosix(snapshotPathA),
+        generatedAt: snapshotA.generatedAt || '',
+        noteCount: notesA.length,
+      },
+      b: {
+        path: toPosix(snapshotPathB),
+        generatedAt: snapshotB.generatedAt || '',
+        noteCount: notesB.length,
+      },
+    },
+    summary: {
+      totalA: notesA.length,
+      totalB: notesB.length,
+      added: added.length,
+      removed: removed.length,
+      modified: modified.length,
+      unchanged,
+      statusChanges,
+      tagChanges,
+    },
+    added,
+    removed,
+    modified,
+    unchanged,
+    drift: {
+      noteGrowth,
+      statusDrift,
+      tagTrends,
+    },
+  };
+}

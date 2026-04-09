@@ -2836,3 +2836,1552 @@ export function scanExecutorCompat(root) {
     })),
   };
 }
+
+// ── Status Paragraph Validator ────────────────────────────────────────────────
+
+/**
+ * Validates that every feature in a LibSixtyTen script has an imp-hub-status paragraph.
+ * Checks: paragraph existence, format, status colors, toggle-paragraph consistency.
+ */
+export function validateStatusParagraphs(text, filePath = '') {
+  const lines = text.split(/\r?\n/);
+  const source = text;
+  const issues = [];
+
+  // 1. Find all Paragraph() declarations
+  const paragraphs = [];
+  for (let i = 0; i < lines.length; i++) {
+    const line = lines[i];
+    const pMatch = line.match(/:\s*Paragraph\s*\(\s*["']([^"']+)["']\s*,/);
+    if (pMatch) {
+      paragraphs.push({ name: pMatch[1], line: i + 1 });
+    }
+    const pMatch2 = line.match(/:\s*Paragraph\s*\(\s*\{[^}]*Name\s*=\s*["']([^"']+)["']/);
+    if (pMatch2) {
+      paragraphs.push({ name: pMatch2[1], line: i + 1 });
+    }
+  }
+
+  // 2. Find all Toggles (features that should have status)
+  const toggles = [];
+  for (let i = 0; i < lines.length; i++) {
+    const line = lines[i];
+    const tMatch = line.match(/:\s*Toggle\s*\(\s*\{[^}]*Name\s*=\s*["']([^"']+)["']/);
+    if (tMatch) {
+      toggles.push({ name: tMatch[1], line: i + 1 });
+    }
+  }
+
+  // 3. Check SetText calls (paragraphs being updated)
+  const setTextCalls = [];
+  const statusColors = ['ACTIVE', 'DISABLED', 'WAITING', 'SCANNING', 'TARGETING', 'MOVING', 'FIGHTING', 'COLLECTING', 'RESTING', 'TIMING', 'DONE', 'ERROR'];
+  for (let i = 0; i < lines.length; i++) {
+    const line = lines[i];
+    if (/SetText\s*\(/.test(line)) {
+      // Check if it uses status colors
+      let foundColor = null;
+      for (const color of statusColors) {
+        if (line.includes(color)) { foundColor = color; break; }
+      }
+      // Check if it uses BuildBasicStatus / BuildDetailedStatus / BuildMacroStatus
+      const builderMatch = line.match(/(BuildBasicStatus|BuildDetailedStatus|BuildMacroStatus)\s*\(/);
+      setTextCalls.push({
+        line: i + 1,
+        statusColor: foundColor,
+        builder: builderMatch ? builderMatch[1] : null,
+        text: line.trim().slice(0, 120),
+      });
+    }
+  }
+
+  // 4. Validate: every toggle should have a corresponding paragraph
+  const paraNames = new Set(paragraphs.map(p => p.name.toLowerCase()));
+  for (const toggle of toggles) {
+    const toggleKey = toggle.name.toLowerCase();
+    // Check if there's a paragraph with similar name
+    const hasPara = paragraphs.some(p =>
+      p.name.toLowerCase().includes(toggleKey) ||
+      toggleKey.includes(p.name.toLowerCase())
+    );
+    if (!hasPara) {
+      issues.push({
+        line: toggle.line,
+        severity: 'warning',
+        rule: 'missing-paragraph',
+        message: `Toggle "${toggle.name}" has no corresponding status paragraph.`,
+      });
+    }
+  }
+
+  // 5. Validate: every paragraph should have SetText call
+  for (const para of paragraphs) {
+    const hasSetText = setTextCalls.some(c => c.line > para.line);
+    if (!hasSetText) {
+      issues.push({
+        line: para.line,
+        severity: 'info',
+        rule: 'no-settext',
+        message: `Paragraph "${para.name}" declared but no SetText call found after it.`,
+      });
+    }
+  }
+
+  // 6. Validate: status colors used in SetText
+  const missingColor = setTextCalls.filter(c => !c.statusColor && !c.builder);
+  for (const mc of missingColor) {
+    issues.push({
+      line: mc.line,
+      severity: 'info',
+      rule: 'no-status-color',
+      message: `SetText call does not use a recognized status color or builder.`,
+    });
+  }
+
+  // 7. Check for STATUS_COLORS definition
+  const hasStatusColors = /STATUS_COLORS/.test(source);
+  if (!hasStatusColors && setTextCalls.length > 0) {
+    issues.push({
+      line: 0,
+      severity: 'warning',
+      rule: 'no-status-colors-const',
+      message: 'No STATUS_COLORS constant found but SetText calls exist — colors may be inconsistent.',
+    });
+  }
+
+  // 8. Check for status builder functions
+  const builders = {
+    basic: /BuildBasicStatus/.test(source),
+    detailed: /BuildDetailedStatus/.test(source),
+    macro: /BuildMacroStatus/.test(source),
+  };
+  const builderCount = (builders.basic ? 1 : 0) + (builders.detailed ? 1 : 0) + (builders.macro ? 1 : 0);
+
+  const bySeverity = { error: 0, warning: 0, info: 0 };
+  for (const issue of issues) {
+    bySeverity[issue.severity] = (bySeverity[issue.severity] || 0) + 1;
+  }
+
+  const verdict = bySeverity.error > 0 ? 'FAIL' : bySeverity.warning > 0 ? 'WARN' : 'PASS';
+
+  return {
+    filePath: toPosix(filePath),
+    verdict,
+    summary: {
+      totalParagraphs: paragraphs.length,
+      totalToggles: toggles.length,
+      setTextCalls: setTextCalls.length,
+      hasStatusColors,
+      builders,
+      builderCount,
+    },
+    issues,
+    bySeverity,
+  };
+}
+
+export function scanStatusParagraphs(root) {
+  const files = walkFiles(root, (filePath) => {
+    const ext = path.extname(filePath).toLowerCase();
+    return LUau_EXTENSIONS.has(ext);
+  });
+  const results = [];
+  for (const file of files) {
+    const text = readText(file);
+    if (!text) continue;
+    const relPath = toPosix(relative(root, file));
+    const check = validateStatusParagraphs(text, relPath);
+    if (check.summary.totalParagraphs > 0 || check.issues.length > 0) {
+      results.push(check);
+    }
+  }
+  return { totalFiles: results.length, files: results };
+}
+
+// ── Risk Summary (Executive) ─────────────────────────────────────────────────
+
+/**
+ * Executive risk summary grouped by severity with effort estimates.
+ */
+export function summarizeRisks(root) {
+  const scan = scanLuauWorkspace(root);
+  const findings = [];
+
+  for (const f of scan.files) {
+    const filePath = path.isAbsolute(f.filePath) ? f.filePath : path.join(root, f.filePath);
+    const text = readText(filePath);
+    if (!text) continue;
+
+    // Analyze each risk category
+    const risks = f.categories.risks;
+    for (const risk of risks) {
+      let severity = 'info';
+      let effort = 'quick';
+      if (risk.label === 'unbounded-loop' || risk.label === 'local-pressure-critical') { severity = 'error'; effort = 'medium'; }
+      else if (risk.label === 'missing-pcall' || risk.label === 'local-pressure-warning') { severity = 'warning'; effort = 'quick'; }
+      else if (risk.label === 'wait' || risk.label === 'spawn' || risk.label === 'delay') { severity = 'warning'; effort = 'quick'; }
+      else if (risk.label === 'repeat-wait') { severity = 'warning'; effort = 'medium'; }
+
+      findings.push({
+        file: f.filePath,
+        line: risk.line,
+        severity,
+        rule: risk.label,
+        text: risk.text,
+        effort,
+        fixable: ['wait', 'spawn', 'delay', 'missing-pcall'].includes(risk.label),
+      });
+    }
+  }
+
+  // Group by severity
+  const bySeverity = { error: [], warning: [], info: [] };
+  for (const finding of findings) {
+    bySeverity[finding.severity].push(finding);
+  }
+
+  // By effort
+  const byEffort = { quick: 0, medium: 0, hard: 0 };
+  for (const finding of findings) {
+    if (finding.effort === 'quick') byEffort.quick++;
+    else if (finding.effort === 'medium') byEffort.medium++;
+    else byEffort.hard++;
+  }
+
+  // Top risky files
+  const fileRiskCount = {};
+  for (const finding of findings) {
+    fileRiskCount[finding.file] = (fileRiskCount[finding.file] || 0) + 1;
+  }
+  const topFiles = Object.entries(fileRiskCount)
+    .sort((a, b) => b[1] - a[1])
+    .slice(0, 10)
+    .map(([file, count]) => ({ file, count }));
+
+  // Auto-fixable
+  const fixable = findings.filter(f => f.fixable);
+
+  return {
+    totalFindings: findings.length,
+    bySeverity: {
+      error: bySeverity.error.length,
+      warning: bySeverity.warning.length,
+      info: bySeverity.info.length,
+    },
+    byEffort,
+    fixableCount: fixable.length,
+    topFiles,
+    details: bySeverity,
+  };
+}
+
+// ── Diff Summary (Human-Readable) ────────────────────────────────────────────
+
+/**
+ * Human-readable summary of changes between V1 and V2.
+ */
+export function summarizeDiff(oldText, newText, oldPath = '', newPath = '') {
+  const oldLines = oldText.split(/\r?\n/).length;
+  const newLines = newText.split(/\r?\n/).length;
+  const oldLower = oldText.toLowerCase();
+  const newLower = newText.toLowerCase();
+
+  // Feature changes
+  const featureChanges = [];
+  const features = [
+    { name: 'Auto Block', patterns: ['autoblock', 'auto.block', 'block.range'] },
+    { name: 'Auto Counter', patterns: ['counter', 'countermode', 'auto.counter'] },
+    { name: 'Auto Ultimate', patterns: ['autoult', 'auto.ult', 'auto.ultimate'] },
+    { name: 'Auto Evasive', patterns: ['autoevasive', 'auto.evasive', 'ragdoll'] },
+    { name: 'Auto Farm', patterns: ['farm', 'farmp', 'auto.farm'] },
+    { name: 'Orbit Mode', patterns: ['orbit', 'orbitspeed', 'orbitdist'] },
+    { name: 'Saved Positions', patterns: ['savepos', 'savedposition', 'save.position'] },
+    { name: 'Escape', patterns: ['escape', 'escapehp', 'escape.on'] },
+    { name: 'Auto Skills', patterns: ['autoskill', 'auto.skill', 'skilltouse'] },
+    { name: 'Character Select', patterns: ['characterselect', 'autochangechar', 'change.character'] },
+    { name: 'WalkSpeed', patterns: ['walkspeed', 'setws', 'set.walk'] },
+    { name: 'JumpPower', patterns: ['jumppower', 'setjp', 'set.jump'] },
+    { name: 'Teleport Tween', patterns: ['tween', 'tweenspeed', 'teleportmode'] },
+    { name: 'Return to Spawn', patterns: ['return', 'returntospawn', 'return.to'] },
+    { name: 'Stop on Damage', patterns: ['stopon', 'stop.damage', 'stoponhit'] },
+    { name: 'Target Priority', patterns: ['targetpriority', 'target.priority', 'priority'] },
+    { name: 'Status Paragraphs', patterns: ['paragraph', 'settext', 'buildstatus'] },
+    { name: 'ThemeManager', patterns: ['thememanager', 'theme_manager'] },
+    { name: 'SaveManager', patterns: ['savemanager', 'save_manager'] },
+    { name: 'FPS Boost', patterns: ['setfpscap', 'fpscap'] },
+  ];
+
+  for (const feat of features) {
+    const inOld = feat.patterns.some(p => oldLower.includes(p));
+    const inNew = feat.patterns.some(p => newLower.includes(p));
+    if (inOld && inNew) featureChanges.push({ feature: feat.name, change: 'preserved' });
+    else if (!inOld && inNew) featureChanges.push({ feature: feat.name, change: 'added' });
+    else if (inOld && !inNew) featureChanges.push({ feature: feat.name, change: 'removed' });
+  }
+
+  // Remote changes
+  const oldRemoteNames = new Set();
+  const newRemoteNames = new Set();
+  const oldRemoteRe = /(\w[\w.]*)\s*:\s*(FireServer|InvokeServer)\s*\(/g;
+  let rm;
+  const oldRemoteText = oldText;
+  while ((rm = oldRemoteRe.exec(oldRemoteText)) !== null) oldRemoteNames.add(rm[1]);
+  const newRemoteRe2 = /(\w[\w.]*)\s*:\s*(FireServer|InvokeServer)\s*\(/g;
+  while ((rm = newRemoteRe2.exec(newText)) !== null) newRemoteNames.add(rm[1]);
+  const lostRemotes = [...oldRemoteNames].filter(r => !newRemoteNames.has(r));
+  const addedRemotes = [...newRemoteNames].filter(r => !oldRemoteNames.has(r));
+
+  // UI library change
+  const oldLib = /Library:Window/.test(oldText) ? 'LibSixtyTen' : /Library:CreateWindow/.test(oldText) ? 'Obsidian' : 'Unknown';
+  const newLib = /Library:Window/.test(newText) ? 'LibSixtyTen' : /Library:CreateWindow/.test(newText) ? 'Obsidian' : 'Unknown';
+
+  // pcall coverage
+  const oldRemoteCount = [...oldRemoteNames].length;
+  const newRemoteCount = [...newRemoteNames].length;
+  const oldPcall = (oldText.match(/\bpcall\b/g) || []).length;
+  const newPcall = (newText.match(/\bpcall\b/g) || []).length;
+
+  return {
+    paths: { old: toPosix(oldPath), new: toPosix(newPath) },
+    size: { old: oldLines, new: newLines, delta: newLines - oldLines },
+    uiLibrary: { old: oldLib, new: newLib, changed: oldLib !== newLib },
+    features: featureChanges,
+    featureSummary: {
+      preserved: featureChanges.filter(f => f.change === 'preserved').length,
+      added: featureChanges.filter(f => f.change === 'added').length,
+      removed: featureChanges.filter(f => f.change === 'removed').length,
+    },
+    remotes: { lost: lostRemotes, added: addedRemotes },
+    pcall: { old: oldPcall, new: newPcall, delta: newPcall - oldPcall },
+  };
+}
+
+// ── V2 Scaffold Generator ───────────────────────────────────────────────────
+
+/**
+ * Generates a V2 scaffold from a V1 file.
+ * Produces: imports, service caching, LibSixtyTen load, window/dashboard,
+ * section adapters, loop placeholders, paragraph refs, ThemeManager/SaveManager.
+ */
+export function generateV2Scaffold(v1Text, gameName = '') {
+  const safeName = gameName || 'UnknownGame';
+  const lines = v1Text.split(/\r?\n/);
+
+  // Detect V1 features
+  const features = [];
+  const featurePatterns = [
+    { name: 'AutoBlock', patterns: ['autoblock', 'auto.block'] },
+    { name: 'AutoCounter', patterns: ['counter', 'countermode'] },
+    { name: 'AutoUltimate', patterns: ['autoult', 'auto.ult'] },
+    { name: 'AutoEvasive', patterns: ['autoevasive', 'ragdoll'] },
+    { name: 'AutoFarm', patterns: ['farm', 'autofarm'] },
+    { name: 'Escape', patterns: ['escape', 'escapehp'] },
+    { name: 'AutoSkills', patterns: ['autoskill', 'skilltouse'] },
+    { name: 'CharacterSelect', patterns: ['characterselect', 'autochangechar'] },
+    { name: 'WalkSpeed', patterns: ['walkspeed', 'setws'] },
+    { name: 'JumpPower', patterns: ['jumppower', 'setjp'] },
+  ];
+  const lowerText = v1Text.toLowerCase();
+  for (const fp of featurePatterns) {
+    if (fp.patterns.some(p => lowerText.includes(p))) features.push(fp.name);
+  }
+
+  // Detect UI library
+  const v1Lib = /Library:CreateWindow/.test(v1Text) ? 'Obsidian' : /Library:Window/.test(v1Text) ? 'LibSixtyTen' : 'Unknown';
+
+  // Detect remotes
+  const remoteNames = new Set();
+  const remoteRe = /(\w[\w.]*)\s*:\s*(FireServer|InvokeServer)\s*\(/g;
+  let rm;
+  while ((rm = remoteRe.exec(v1Text)) !== null) remoteNames.add(rm[1]);
+
+  const scaffold = `--[[
+    Imp Hub X — ${safeName} V2
+    Auto-generated scaffold from V1 (${v1Lib} → LibSixtyTen)
+    Features detected: ${features.length > 0 ? features.join(', ') : 'none'}
+]]
+
+-- ============================================================
+-- 1. CACHED SERVICES
+-- ============================================================
+local Players = game:GetService("Players")
+local RunService = game:GetService("RunService")
+local TweenService = game:GetService("TweenService")
+local ReplicatedStorage = game:GetService("ReplicatedStorage")
+local Workspace = game:GetService("Workspace")
+
+-- ============================================================
+-- 2. LOCAL VARIABLE CACHING
+-- ============================================================
+local t_insert, t_find, t_remove, t_sort = table.insert, table.find, table.remove, table.sort
+local m_huge, m_clamp = math.huge, math.clamp
+local str_fmt = string.format
+local pcallRef, taskWait, taskSpawn = pcall, task.wait, task.spawn
+
+local Plr = Players.LocalPlayer
+local Character = Plr.Character or Plr.CharacterAdded:Wait()
+Plr.CharacterAdded:Connect(function(c) Character = c end)
+
+-- ============================================================
+-- 3. LIBSIXTYTEN LOAD
+-- ============================================================
+local function LoadLibSixtyTen()
+    local urls = {
+        "https://raw.githubusercontent.com/Nanana291/Kong/refs/heads/main/LibSixtyTen.lua",
+    }
+    for _, url in ipairs(urls) do
+        local ok, result = pcallRef(function()
+            local source = game:HttpGet(url)
+            if source and #source > 0 then
+                local chunk = loadstring(source)
+                return chunk and chunk() or nil
+            end
+            return nil
+        end)
+        if ok and result and type(result) == "table" then return result end
+    end
+    warn("${safeName}: LibSixtyTen load failed")
+    return nil
+end
+
+local Library = LoadLibSixtyTen()
+if not Library then return end
+
+local Options = {}
+local Toggles = {}
+
+-- ============================================================
+-- 4. STATUS SYSTEM
+-- ============================================================
+local STATUS_COLORS = {
+    DISABLED = "#ef4444", ACTIVE = "#22c55e", WAITING = "#f59e0b",
+    SCANNING = "#06b6d4", TARGETING = "#3b82f6", MOVING = "#0ea5e9",
+    FIGHTING = "#f97316", DONE = "#84cc16", ERROR = "#dc2626",
+}
+
+local function BuildBasicStatus(state, subtext)
+    local s = STATUS_COLORS[state] and state or "DISABLED"
+    return str_fmt(
+        "<font size='14' color='%s'><b>● %s</b></font>\\n<font size='12' color='%s'>%s</font>",
+        STATUS_COLORS[s], s, "#9ca3af", subtext or "Ready..."
+    )
+end
+
+local function BuildDetailedStatus(state, headline, meta)
+    local s = STATUS_COLORS[state] and state or "DISABLED"
+    local m = meta and str_fmt("\\n<font size='11' color='%s'>%s</font>", "#6b7280", meta) or ""
+    return str_fmt(
+        "<font size='14' color='%s'><b>● %s</b></font>\\n<font size='13' color='%s'>%s</font>%s",
+        STATUS_COLORS[s], s, "#f3f4f6", headline or "Ready...", m
+    )
+end
+
+-- ============================================================
+-- 5. SECTION ADAPTER
+-- ============================================================
+local function CreateSectionAdapter(section)
+    local adapter = { Section = section }
+    function adapter:AddToggle(flag, config)
+        Toggles[flag] = { Element = nil, Value = config.Default or false }
+        local toggle = section:Toggle({
+            Name = config.Text or flag, Flag = flag, Default = config.Default or false,
+            ToolTip = config.Tooltip or "",
+            Callback = function(value)
+                if Toggles[flag] then Toggles[flag].Value = value end
+                if config.Callback then config.Callback(value) end
+            end,
+        })
+        Toggles[flag].Element = toggle
+        return Toggles[flag]
+    end
+    function adapter:AddSlider(flag, config)
+        Options[flag] = { Element = nil, Value = config.Default }
+        local slider = section:Slider({
+            Name = config.Text or flag, Flag = flag, Default = config.Default,
+            Min = config.Min, Max = config.Max,
+            Callback = function(value)
+                if Options[flag] then Options[flag].Value = value end
+                if config.Callback then config.Callback(value) end
+            end,
+        })
+        Options[flag].Element = slider
+        return Options[flag]
+    end
+    function adapter:AddDropdown(flag, config)
+        Options[flag] = { Element = nil, Value = config.Default }
+        local dd = section:Dropdown({
+            Name = config.Text or flag, Flag = flag,
+            Items = config.Values or {}, Multi = config.Multi or false,
+            Callback = function(value)
+                if Options[flag] then Options[flag].Value = value end
+                if config.Callback then config.Callback(value) end
+            end,
+        })
+        Options[flag].Element = dd
+        return Options[flag]
+    end
+    function adapter:AddButton(config)
+        return section:Button({
+            Name = config.Text, ToolTip = config.Tooltip or "",
+            Callback = config.Func or function() end,
+        })
+    end
+    function adapter:AddParagraph(name, text)
+        return section:Paragraph({ Name = name, Text = text or BuildBasicStatus("DISABLED", "No status set") })
+    end
+    return adapter
+end
+
+-- ============================================================
+-- 6. WINDOW + DASHBOARD
+-- ============================================================
+local Window = Library:Window({
+    Name = "Imp Hub X",
+    SubName = "${safeName}",
+    Logo = "79000737943964",
+    SelectedTab = 1,
+    Compact = false,
+})
+
+Library:CreateDashboard(Window)
+
+-- ============================================================
+-- 7. PAGES + TABS
+-- ============================================================
+local Pages = {
+    Main      = Window:Page({ Name = "Main",      Icon = "home",        Columns = 2 }),
+    Combat    = Window:Page({ Name = "Combat",    Icon = "swords",      Columns = 2 }),
+    Farming   = Window:Page({ Name = "Farming",   Icon = "crosshair",   Columns = 2 }),
+    Players   = Window:Page({ Name = "Players",   Icon = "user",        Columns = 2 }),
+    Teleports = Window:Page({ Name = "Teleports", Icon = "map-pin",     Columns = 2 }),
+    Misc      = Window:Page({ Name = "Misc",      Icon = "more-horizontal", Columns = 2 }),
+    Settings  = Window:Page({ Name = "Settings",  Icon = "settings",    Columns = 1 }),
+}
+
+local Tabs = {
+    Main      = CreateSectionAdapter(Pages.Main),
+    Combat    = CreateSectionAdapter(Pages.Combat),
+    Farming   = CreateSectionAdapter(Pages.Farming),
+    Players   = CreateSectionAdapter(Pages.Players),
+    Teleports = CreateSectionAdapter(Pages.Teleports),
+    Misc      = CreateSectionAdapter(Pages.Misc),
+    Settings  = CreateSectionAdapter(Pages.Settings),
+}
+
+-- ============================================================
+-- 8. FEATURE PLACEHOLDERS
+-- ============================================================
+${features.map(f => `// TODO: Implement ${f} — see V1 logic
+`).join('')}
+-- Paragraph refs — assign after UI creation
+${features.map(f => {
+  const name = f.replace(/([A-Z])/g, ' $1').trim();
+  return `local ${f}Status = Tabs.${f.includes('Block') ? 'Combat' : f.includes('Farm') ? 'Farming' : f.includes('Skill') ? 'Farming' : f.includes('Escape') ? 'Teleports' : 'Main'}:AddParagraph("${name} Status", BuildBasicStatus("DISABLED", "Off"))`;
+}).join('\n')}
+
+-- ============================================================
+-- 9. REMOTE CACHE
+-- ============================================================
+-- Detected remotes from V1: ${[...remoteNames].join(', ') || 'none detected'}
+-- TODO: Verify and map each remote
+
+-- ============================================================
+-- 10. RUNTIME LOOPS (one per feature, pcallRef wrapped)
+-- ============================================================
+${features.map(f => `taskSpawn(function()
+    while taskWait(0.1) do
+        if not (Toggles["${f}"] and Toggles["${f}"].Value) then continue end
+        pcallRef(function()
+            -- TODO: Implement ${f} logic from V1
+        end)
+    end
+end)`).join('\n\n')}
+
+-- ============================================================
+-- 11. SETTINGS + SAVE/THEME
+-- ============================================================
+local repo = "https://raw.githubusercontent.com/Nanana291/Kong/refs/heads/main/"
+pcallRef(function()
+    local ThemeManager = loadstring(game:HttpGet(repo .. "addons/ThemeManager.lua"))()
+    local SaveManager = loadstring(game:HttpGet(repo .. "addons/SaveManager.lua"))()
+    if ThemeManager and SaveManager then
+        ThemeManager:SetLibrary(Library)
+        SaveManager:SetLibrary(Library)
+        ThemeManager:SetFolder("ImpHub")
+        SaveManager:SetFolder("ImpHub/${safeName}")
+        SaveManager:BuildConfigSection(Tabs.Settings)
+        ThemeManager:ApplyToTab(Tabs.Settings)
+        SaveManager:LoadAutoloadConfig()
+    end
+end)
+
+-- ============================================================
+-- 12. LOAD NOTIFICATION
+-- ============================================================
+Library:Notify({
+    Title = "Imp Hub X",
+    Description = "${safeName} V2 loaded",
+    SubText = "Scaffold — implement features from V1",
+    Type = "info",
+    Time = 6,
+})
+`;
+
+  return {
+    gameName: safeName,
+    v1Library: v1Lib,
+    featuresDetected: features,
+    remoteCount: remoteNames.size,
+    scaffold,
+    lineCount: scaffold.split(/\r?\n/).length,
+  };
+}
+
+// ── Explain Luau Text (Natural-Language) ─────────────────────────────────────
+
+/**
+ * Composes a natural-language explanation of what a Luau script does.
+ * Uses analyzeLuauText, extractRemotePayloads, extractFlagsFromText,
+ * and checkRespawnLifecycle as composition sources.
+ */
+export function explainLuauText(text, filePath = '') {
+  const source = String(text || '');
+  const lines = source.split(/\r?\n/);
+
+  // Compose from existing analysis
+  const analysis = analyzeLuauText(text, filePath);
+  const remoteData = extractRemotePayloads(text, filePath);
+  const flags = extractFlagsFromText(text, filePath);
+  const respawn = checkRespawnLifecycle(text, filePath);
+
+  // Detect UI library
+  let uiLibrary = 'Unknown';
+  if (/Library:Window\s*\(/.test(source) && /CreateDashboard\s*\(/.test(source)) {
+    uiLibrary = 'LibSixtyTen';
+  } else if (/Library:CreateWindow\s*\(/.test(source) || /Library:Window\s*\(/.test(source)) {
+    // Ambiguous — check for Obsidian-specific patterns
+    if (/CreateDashboard/.test(source)) {
+      uiLibrary = 'LibSixtyTen';
+    } else if (/Library:CreateWindow/.test(source)) {
+      uiLibrary = 'Obsidian';
+    }
+  }
+  // Fallback: check for other UI library signatures
+  if (uiLibrary === 'Unknown' && /loadstring.*LibSixtyTen/.test(source)) {
+    uiLibrary = 'LibSixtyTen';
+  } else if (uiLibrary === 'Unknown' && /loadstring.*Obsidian/.test(source)) {
+    uiLibrary = 'Obsidian';
+  }
+
+  // Detect features from flag names, UI sections, function names, and comments
+  const allText_lower = source.toLowerCase();
+  const featureKeywords = [
+    { name: 'Auto Farm', patterns: ['auto.farm', 'autofarm', 'auto farm', 'farmp'] },
+    { name: 'Auto Block', patterns: ['auto.block', 'autoblock', 'auto block'] },
+    { name: 'Auto Counter', patterns: ['auto.counter', 'autocounter', 'auto counter', 'countermode'] },
+    { name: 'Auto Ultimate', patterns: ['auto.ultimate', 'autoult', 'auto ultimate'] },
+    { name: 'Auto Evasive', patterns: ['auto.evasive', 'autoevasive', 'auto evasive'] },
+    { name: 'Auto Skills', patterns: ['auto.skill', 'autoskill', 'auto skill', 'skilltouse'] },
+    { name: 'ESP', patterns: ['esp', 'highlight', 'chams', 'esp render'] },
+    { name: 'Teleport', patterns: ['teleport', 'tp to', 'tween to', 'teleportmode'] },
+    { name: 'Orbit', patterns: ['orbit', 'orbitspeed', 'orbitdist', 'orbit mode'] },
+    { name: 'Combat', patterns: ['combat', 'auto.attack', 'autoattack', 'attack mode'] },
+    { name: 'WalkSpeed', patterns: ['walkspeed', 'setws', 'set.walk'] },
+    { name: 'JumpPower', patterns: ['jumppower', 'setjp', 'set.jump'] },
+    { name: 'Settings', patterns: ['thememanager', 'savemanager', 'config', 'settings tab'] },
+    { name: 'Character Select', patterns: ['characterselect', 'change.character', 'autochangechar'] },
+    { name: 'Return to Spawn', patterns: ['returntospawn', 'return.to', 'return to spawn'] },
+  ];
+
+  const detectedFeatures = [];
+  for (const feat of featureKeywords) {
+    if (feat.patterns.some(p => allText_lower.includes(p))) {
+      detectedFeatures.push(feat.name);
+    }
+  }
+
+  // Also check flag names for feature hints
+  for (const flag of flags.allFlags || []) {
+    const flagLower = flag.name.toLowerCase();
+    if (flagLower.includes('farm') && !detectedFeatures.includes('Auto Farm')) detectedFeatures.push('Auto Farm');
+    if (flagLower.includes('block') && !detectedFeatures.includes('Auto Block')) detectedFeatures.push('Auto Block');
+    if (flagLower.includes('esp') && !detectedFeatures.includes('ESP')) detectedFeatures.push('ESP');
+    if (flagLower.includes('teleport') && !detectedFeatures.includes('Teleport')) detectedFeatures.push('Teleport');
+  }
+
+  // Detect services
+  const serviceRe = /game\s*:\s*GetService\s*\(\s*["']([^"']+)["']\s*\)/g;
+  const services = new Set();
+  let sm;
+  while ((sm = serviceRe.exec(source)) !== null) {
+    services.add(sm[1]);
+  }
+
+  // Detect require() targets
+  const requireRe = /require\s*\(\s*([^)]+)\s*\)/g;
+  const modules = new Set();
+  let rm;
+  while ((rm = requireRe.exec(source)) !== null) {
+    modules.add(rm[1].trim().slice(0, 80));
+  }
+
+  // Detect UI sections (Pages, Sections)
+  const sectionRe = /(?:Page|Section|Category)\s*\(\s*\{[^}]*Name\s*=\s*["']([^"']+)["']/g;
+  const sections = [];
+  let scm;
+  while ((scm = sectionRe.exec(source)) !== null) {
+    sections.push(scm[1]);
+  }
+
+  // Also detect simpler patterns
+  const simpleSectionRe = /:\s*(Page|Section|Category)\s*\(\s*["']([^"']+)["']/g;
+  let sscm;
+  while ((sscm = simpleSectionRe.exec(source)) !== null) {
+    if (!sections.includes(sscm[2])) sections.push(sscm[2]);
+  }
+
+  // Analyze loops
+  const loopRe = /\b(while|for|repeat)\b/g;
+  const pcallRe = /\bpcall\b/g;
+  const charCheckRe = /FindFirstChild\s*\(\s*["']HumanoidRootPart["']\s*\)|Character\s*&&|Character\s*\?\./g;
+  let loopCount = 0, loopMatch;
+  while ((loopMatch = loopRe.exec(source)) !== null) loopCount++;
+
+  // More precise: count while/for loops that are actual loop bodies
+  const whileLoops = (source.match(/\bwhile\s+/g) || []).length;
+  const forLoops = (source.match(/\bfor\s+/g) || []).length;
+  const totalLoops = whileLoops + forLoops;
+
+  let pcallInLoops = 0;
+  let charCheckInLoops = 0;
+  for (let i = 0; i < lines.length; i++) {
+    const line = lines[i];
+    if (/\bwhile\s+/.test(line) || /\bfor\s+/.test(line)) {
+      // Check next 10 lines for pcall and char check
+      const loopBody = lines.slice(i, Math.min(i + 12, lines.length)).join('\n');
+      if (/\bpcall\b/.test(loopBody)) pcallInLoops++;
+      if (/HumanoidRootPart|Character\s*=|Character\s*&&/.test(loopBody)) charCheckInLoops++;
+    }
+  }
+
+  // Remote summary
+  const remoteNames = remoteData.summary.remoteNames || [];
+  const remoteCallCount = remoteData.summary.totalCalls || 0;
+
+  // Build natural language explanation
+  const featureList = detectedFeatures.length > 0 ? detectedFeatures.join(', ') : 'various game features';
+  const featureListSentence = detectedFeatures.length > 0
+    ? detectedFeatures.map(f => f.toLowerCase()).join(', ')
+    : 'various game features';
+
+  const remoteSummary = remoteCallCount > 0
+    ? `${remoteCallCount} remote call(s) to ${remoteNames.slice(0, 5).join(', ')}${remoteNames.length > 5 ? ' and others' : ''}`
+    : 'no direct remote calls detected';
+
+  const respawnStatus = respawn.verdict === 'PASS'
+    ? 'has proper respawn handler with character lifecycle support'
+    : respawn.verdict === 'WARN'
+      ? 'has partial respawn handling but some gaps exist'
+      : 'lacks proper respawn handling — will break after character death';
+
+  const riskSummary = analysis.summary.riskCount > 0
+    ? `${analysis.summary.riskCount} risk(s) detected (deprecated APIs, unwrapped remotes, or unbounded loops)`
+    : 'no significant risks detected';
+
+  const explanation = `This is a ${analysis.summary.lineCount}-line ${uiLibrary} script for ${featureList}. It provides ${featureListSentence}. `
+    + `Remote calls: ${remoteSummary}. `
+    + `Character lifecycle: ${respawn}. `
+    + `Risks: ${riskSummary}.`;
+
+  return {
+    filePath: toPosix(filePath),
+    summary: {
+      lineCount: analysis.summary.lineCount,
+      localCount: analysis.summary.localCount,
+      callbackCount: analysis.summary.callbackCount,
+      remoteCount: analysis.summary.remoteCount,
+      riskCount: analysis.summary.riskCount,
+      flagCount: flags.totalDefined,
+      uiLibrary,
+      features: detectedFeatures,
+      hasRespawnHandler: respawn.verdict !== 'FAIL',
+    },
+    explanation,
+    structure: {
+      services: [...services].sort(),
+      modules: [...modules].sort(),
+      sections,
+      loops: {
+        count: totalLoops,
+        withPcall: pcallInLoops,
+        withCharCheck: charCheckInLoops,
+      },
+    },
+    risks: {
+      total: analysis.summary.riskCount,
+      unprotectedRemotes: analysis.categories.risks.filter(r => r.label === 'missing-pcall').length,
+      orphanedConnections: respawn.findings.orphanedConnections || false,
+      deprecatedApi: analysis.categories.risks.filter(r => ['wait', 'spawn', 'delay'].includes(r.label)).length,
+    },
+  };
+}
+
+// ── Repair Luau Risk (Apply Fix) ─────────────────────────────────────────────
+
+/**
+ * Applies a risk fix to the Luau text. Uses repairLuauRisk to get the
+ * before/after snippet, then applies the fix at the correct line.
+ */
+export function repairLuauRiskApply(text, filePath, riskLabel, options = {}) {
+  const source = String(text || '');
+  const lines = source.split(/\r?\n/);
+  const label = String(riskLabel || '').trim().toLowerCase();
+  const apply = options.apply !== false;
+
+  // Get the proposed fix from repairLuauRisk
+  const repair = repairLuauRisk(text, filePath, riskLabel);
+  const lineIndex = (repair.summary.line || 1) - 1;
+  const beforeLine = repair.before;
+
+  // Determine the actual replacement
+  let afterLine = repair.after;
+  let explanation = repair.explanation;
+
+  // For multi-line replacements (like pcall wrapping), handle properly
+  if (label === 'missing-pcall') {
+    const originalLine = lines[lineIndex] || '';
+    const indent = originalLine.match(/^\s*/)?.[0] || '';
+    const trimmed = originalLine.trim();
+    afterLine = `${indent}pcall(function()\n${indent}    ${trimmed}\n${indent}end)`;
+    explanation = 'Wrap the remote call in pcall so failures do not crash the script.';
+  } else if (label === 'wait') {
+    const originalLine = lines[lineIndex] || '';
+    afterLine = originalLine.replace(/\bwait\s*\(/g, 'task.wait(');
+    explanation = 'Replace legacy wait() with task.wait() to match modern Luau scheduling.';
+  } else if (label === 'spawn') {
+    const originalLine = lines[lineIndex] || '';
+    afterLine = originalLine.replace(/\bspawn\s*\(/g, 'task.spawn(');
+    explanation = 'Replace spawn() with task.spawn() to avoid legacy scheduler behavior.';
+  } else if (label === 'unbounded-loop') {
+    const originalLine = lines[lineIndex] || '';
+    afterLine = originalLine + '\n-- TODO: add a termination condition or iteration limit';
+    explanation = 'Add a bounded loop or explicit exit condition before shipping this code path.';
+  } else if (label === 'connection-cleanup') {
+    const helperBlock = [
+      'local __helperConnections = {}',
+      'local function __helperTrack(connection)',
+      '    __helperConnections[#__helperConnections + 1] = connection',
+      '    return connection',
+      'end',
+      '',
+    ];
+    afterLine = helperBlock.join('\n');
+    explanation = 'Track connections and disconnect them during teardown to prevent leaks.';
+  } else if (label === 'remote-rate-limit') {
+    const originalLine = lines[lineIndex] || '';
+    const indent = originalLine.match(/^\s*/)?.[0] || '';
+    afterLine = `${indent}task.wait(0.15)\n${originalLine}`;
+    explanation = 'Throttle repeated remote calls so the script does not spam the server.';
+  }
+
+  // Build new text
+  let newText = source;
+  if (apply && lineIndex >= 0 && lineIndex < lines.length) {
+    const newLines = [...lines];
+    if (afterLine.includes('\n')) {
+      // Multi-line replacement
+      const afterLines = afterLine.split('\n');
+      newLines.splice(lineIndex, 1, ...afterLines);
+    } else {
+      newLines[lineIndex] = afterLine;
+    }
+    newText = newLines.join('\n');
+  }
+
+  return {
+    filePath: toPosix(filePath),
+    riskLabel: label,
+    applied: apply && lineIndex >= 0,
+    line: (repair.summary.line || 1),
+    before: beforeLine,
+    after: afterLine,
+    newText,
+    explanation,
+  };
+}
+
+// ── Simulate Respawn Lifecycle ───────────────────────────────────────────────
+
+/**
+ * Extended version of checkRespawnLifecycle that simulates the full respawn flow.
+ */
+export function simulateRespawnLifecycle(text, filePath = '') {
+  const source = String(text || '');
+  const lines = source.split(/\r?\n/);
+
+  // Use checkRespawnLifecycle as the base
+  const base = checkRespawnLifecycle(text, filePath);
+
+  // Analyze loops for respawn safety
+  const loopAnalysis = {
+    total: 0,
+    withCharGuard: 0,
+    withoutGuard: 0,
+    wouldSurviveRespawn: 0,
+    wouldFailOnRespawn: 0,
+  };
+
+  for (let i = 0; i < lines.length; i++) {
+    const line = lines[i];
+    if (/\bwhile\s+/.test(line) || /\bfor\s+/.test(line)) {
+      loopAnalysis.total++;
+      // Check next 15 lines for character guards
+      const loopBody = lines.slice(i, Math.min(i + 15, lines.length)).join('\n');
+      const hasCharGuard = /HumanoidRootPart|Character\s*==\s*nil|not\s+Character|FindFirstChild.*HumanoidRootPart|Character\s*&&/.test(loopBody);
+      const hasContinue = /\bcontinue\b/.test(loopBody);
+
+      if (hasCharGuard) {
+        loopAnalysis.withCharGuard++;
+        loopAnalysis.wouldSurviveRespawn++;
+      } else {
+        loopAnalysis.withoutGuard++;
+        loopAnalysis.wouldFailOnRespawn++;
+      }
+    }
+  }
+
+  // Analyze remotes for character dependency
+  const remoteAnalysis = {
+    total: 0,
+    charDependent: 0,
+    wouldFailWithoutChar: 0,
+  };
+
+  for (let i = 0; i < lines.length; i++) {
+    const line = lines[i];
+    if (/:FireServer\s*\(|:InvokeServer\s*\(/.test(line)) {
+      remoteAnalysis.total++;
+      // Check if this remote call sends Character data
+      const callLine = line;
+      if (/Character|HumanoidRootPart|\.Character/.test(callLine)) {
+        remoteAnalysis.charDependent++;
+        // Check if wrapped in pcall
+        if (!/\bpcall\b/.test(callLine)) {
+          // Check surrounding context
+          const context = lines.slice(Math.max(0, i - 3), Math.min(lines.length, i + 2)).join('\n');
+          if (!/\bpcall\b/.test(context)) {
+            remoteAnalysis.wouldFailWithoutChar++;
+          }
+        }
+      }
+    }
+  }
+
+  // Build lifecycle phases
+  const phases = [];
+
+  // Phase 1: Initial
+  const initialChecks = [];
+  if (/Plr\.Character|LocalPlayer\.Character/.test(source)) {
+    initialChecks.push('Initial Character acquired via Plr.Character');
+  }
+  if (/CharacterAdded\s*:\s*Wait\s*\(\)/.test(source)) {
+    initialChecks.push('CharacterAdded:Wait() used for initial character');
+  }
+  const initialGaps = [];
+  if (!/Plr\.Character|LocalPlayer\.Character/.test(source) && !/CharacterAdded\s*:\s*Wait/.test(source)) {
+    initialGaps.push('No explicit initial character acquisition found');
+  }
+  phases.push({
+    phase: 'initial',
+    checks: initialChecks,
+    connections: base.findings.characterAddedHandler ? ['CharacterAdded handler registered'] : [],
+    gaps: initialGaps,
+  });
+
+  // Phase 2: Alive
+  const aliveChecks = [];
+  if (base.findings.rootNullChecks > 0) {
+    aliveChecks.push(`${base.findings.rootNullChecks} HumanoidRootPart null check(s)`);
+  }
+  if (base.findings.humanoidNullChecks > 0) {
+    aliveChecks.push(`${base.findings.humanoidNullChecks} Humanoid null check(s)`);
+  }
+  phases.push({
+    phase: 'alive',
+    checks: aliveChecks,
+    connections: base.findings.connectionOwnership.map((c, idx) => `Connection #${idx + 1} @ L${c.line}`),
+    gaps: [],
+  });
+
+  // Phase 3: Dead
+  const deadChecks = [];
+  const deadGaps = [];
+  if (!/Died\s*:\s*Connect/.test(source) && !/Humanoid\s*.*Died/.test(source)) {
+    deadGaps.push('No explicit Humanoid.Died handler — death detection relies on CharacterAdded firing');
+  }
+  phases.push({
+    phase: 'dead',
+    checks: deadChecks,
+    connections: [],
+    gaps: deadGaps,
+  });
+
+  // Phase 4: Respawning
+  phases.push({
+    phase: 'respawning',
+    checks: ['CharacterAdded event will fire when new character spawns'],
+    connections: base.findings.characterAddedHandler ? ['CharacterAdded:Connect callback ready'] : [],
+    gaps: base.findings.characterAddedHandler ? [] : ['No CharacterAdded handler registered — will not auto-rebind'],
+  });
+
+  // Phase 5: Rebinding
+  const rebindingChecks = [];
+  if (base.findings.characterVariableUpdate) {
+    rebindingChecks.push('Character variable updated in CharacterAdded callback');
+  }
+  const rebindingGaps = [];
+  if (!base.findings.characterVariableUpdate && base.findings.characterAddedHandler) {
+    rebindingGaps.push('CharacterAdded handler exists but Character variable may not be updated');
+  }
+  phases.push({
+    phase: 'rebinding',
+    checks: rebindingChecks,
+    connections: base.findings.reconnectionPatterns.map(r => `${r.type} @ L${r.line}`),
+    gaps: rebindingGaps,
+  });
+
+  // Phase 6: Active
+  const activeChecks = [];
+  if (loopAnalysis.withCharGuard > 0) {
+    activeChecks.push(`${loopAnalysis.withCharGuard} loop(s) with character guard`);
+  }
+  const activeGaps = [];
+  if (loopAnalysis.withoutGuard > 0) {
+    activeGaps.push(`${loopAnalysis.withoutGuard} loop(s) without character guard — will error on nil HumanoidRootPart`);
+  }
+  phases.push({
+    phase: 'active',
+    checks: activeChecks,
+    connections: [],
+    gaps: activeGaps,
+  });
+
+  // Build state diagram
+  const stateDiagram = [
+    '┌─────────┐     Character.Died      ┌──────┐     CharacterAdded      ┌───────────┐',
+    '│ INITIAL ├─────────────────────────►│ DEAD ├───────────────────────►│ RESPAWNING │',
+    '└────┬────┘                         └──┬───┘                         └─────┬─────┘',
+    '     │                                 │                                   │',
+    '     │  Plr.Character                  │  (no action)                      │  CharacterAdded:Connect',
+    '     ▼                                 ▼                                   ▼',
+    '┌─────────┐     nil HRP check         ┌───────────┐     rebind            ┌──────────┐',
+    '│  ALIVE  ├───────────────────────────►│  ACTIVE   │◄─────────────────────┤ REBIND   │',
+    '└─────────┘                           └───────────┘                       └──────────┘',
+  ].join('\n');
+
+  // Calculate transition coverage
+  const transitions = [
+    { from: 'initial', to: 'alive', hasCheck: initialChecks.length > 0 },
+    { from: 'alive', to: 'dead', hasCheck: true }, // death is automatic
+    { from: 'dead', to: 'respawning', hasCheck: true }, // CharacterAdded is automatic
+    { from: 'respawning', to: 'rebinding', hasCheck: base.findings.characterAddedHandler },
+    { from: 'rebinding', to: 'active', hasCheck: base.findings.characterVariableUpdate },
+    { from: 'alive', to: 'active', hasCheck: loopAnalysis.withCharGuard > 0 },
+  ];
+  const coveredTransitions = transitions.filter(t => t.hasCheck).length;
+  const transitionCoverage = Math.round((coveredTransitions / transitions.length) * 100);
+
+  // Build simulation: character dies
+  const simulation = {
+    scenario: 'character_dies',
+    steps: [],
+    finalState: 'partial',
+  };
+
+  // Step 1: Character dies
+  simulation.steps.push({
+    step: 1,
+    event: 'Character.Died fires',
+    outcome: 'ok',
+    detail: 'Character reference becomes invalid (nil or destroyed).',
+  });
+
+  // Step 2: Character becomes nil
+  simulation.steps.push({
+    step: 2,
+    event: 'Character variable is now nil/stale',
+    outcome: loopAnalysis.withoutGuard > 0 ? 'fail' : 'ok',
+    detail: loopAnalysis.withoutGuard > 0
+      ? `${loopAnalysis.withoutGuard} loop(s) will attempt to access nil HumanoidRootPart — will error.`
+      : 'All loops have character guards — they will skip or wait.',
+  });
+
+  // Step 3: CharacterAdded fires
+  simulation.steps.push({
+    step: 3,
+    event: 'CharacterAdded:Connect callback fires',
+    outcome: base.findings.characterAddedHandler ? 'ok' : 'fail',
+    detail: base.findings.characterAddedHandler
+      ? 'CharacterAdded handler exists and will receive new character.'
+      : 'No CharacterAdded handler — script will not automatically rebind.',
+  });
+
+  // Step 4: Rebind callbacks
+  simulation.steps.push({
+    step: 4,
+    event: 'Rebind callbacks to new Character',
+    outcome: base.findings.characterVariableUpdate ? 'ok' : 'warn',
+    detail: base.findings.characterVariableUpdate
+      ? 'Character variable updated in callback — loops will use new Character reference.'
+      : 'CharacterAdded handler exists but Character variable may not be updated — loops may still reference stale Character.',
+  });
+
+  // Step 5: Restore loops
+  simulation.steps.push({
+    step: 5,
+    event: 'Loops resume with new Character',
+    outcome: loopAnalysis.wouldFailOnRespawn > 0 ? 'warn' : 'ok',
+    detail: loopAnalysis.wouldFailOnRespawn > 0
+      ? `${loopAnalysis.wouldFailOnRespawn} loop(s) lack character guard and may fail before revalidation.`
+      : `All ${loopAnalysis.wouldSurviveRespawn} loop(s) have character guards and will resume safely.`,
+  });
+
+  // Step 6: Remote calls
+  simulation.steps.push({
+    step: 6,
+    event: 'Remote calls resume',
+    outcome: remoteAnalysis.wouldFailWithoutChar > 0 ? 'warn' : 'ok',
+    detail: remoteAnalysis.wouldFailWithoutChar > 0
+      ? `${remoteAnalysis.wouldFailWithoutChar} character-dependent remote call(s) without pcall may error.`
+      : remoteAnalysis.charDependent > 0
+        ? `${remoteAnalysis.charDependent} character-dependent remote(s) — ensure pcall wraps are in place.`
+        : 'No character-dependent remote calls detected.',
+  });
+
+  // Determine final state
+  const failSteps = simulation.steps.filter(s => s.outcome === 'fail');
+  const warnSteps = simulation.steps.filter(s => s.outcome === 'warn');
+  if (failSteps.length > 0) {
+    simulation.finalState = 'broken';
+  } else if (warnSteps.length > 0) {
+    simulation.finalState = 'partial';
+  } else {
+    simulation.finalState = 'recovered';
+  }
+
+  // Build recommendations
+  const recommendations = [];
+  if (!base.findings.characterAddedHandler) {
+    recommendations.push('Add a CharacterAdded:Connect handler to auto-rebind after respawn.');
+  }
+  if (!base.findings.characterVariableUpdate && base.findings.characterAddedHandler) {
+    recommendations.push('Update the Character variable inside the CharacterAdded callback.');
+  }
+  if (loopAnalysis.withoutGuard > 0) {
+    recommendations.push(`Add Character/HumanoidRootPart null checks to ${loopAnalysis.withoutGuard} loop(s) without guards.`);
+  }
+  if (remoteAnalysis.wouldFailWithoutChar > 0) {
+    recommendations.push(`Wrap ${remoteAnalysis.wouldFailWithoutChar} character-dependent remote call(s) in pcall.`);
+  }
+  if (base.findings.orphanedConnections) {
+    recommendations.push('Track and disconnect connections during character death to prevent memory leaks.');
+  }
+  if (recommendations.length === 0) {
+    recommendations.push('Respawn lifecycle handling looks solid — no critical gaps detected.');
+  }
+
+  // Determine overall verdict
+  let verdict = base.verdict;
+  if (simulation.finalState === 'broken') verdict = 'FAIL';
+  else if (simulation.finalState === 'partial' && verdict === 'PASS') verdict = 'WARN';
+
+  return {
+    filePath: toPosix(filePath),
+    verdict,
+    lifecycle: {
+      phases,
+      stateDiagram,
+      transitionCoverage,
+    },
+    loopAnalysis,
+    remoteAnalysis,
+    simulation,
+    recommendations,
+  };
+}
+
+// ── Semantic Luau Search ─────────────────────────────────────────────────────
+
+/**
+ * Semantic search within a Luau file. Unlike regex, understands code structure.
+ * Parses function definitions, variable assignments, remote calls, UI sections.
+ */
+export function semanticLuauSearch(text, filePath, query, options = {}) {
+  const source = String(text || '');
+  const lines = source.split(/\r?\n/);
+  const queryStr = String(query || '').trim();
+  const contextLines = options.context || 2;
+
+  // Build mini index by iterating lines (O(n) instead of O(n²) substring/split)
+  const index = {
+    functions: [],
+    variables: [],
+    remotes: [],
+    uiSections: [],
+    comments: [],
+    keywords: [],
+  };
+
+  for (let i = 0; i < lines.length; i++) {
+    const line = lines[i];
+    const lineNum = i + 1;
+
+    // Function definitions
+    const fnMatch = /(?:local\s+function|function)\s+([\w.:]+)\s*\(/.exec(line) || /(\w+)\s*=\s*function\s*\(/.exec(line);
+    if (fnMatch) index.functions.push({ name: fnMatch[1], line: lineNum });
+
+    // Local variable declarations
+    const localMatch = /local\s+(\w+)\s*=/.exec(line);
+    if (localMatch) index.variables.push({ name: localMatch[1], line: lineNum });
+
+    // Remote calls
+    const remoteMatch = /(\w[\w.]*)\s*:\s*(FireServer|InvokeServer|FireClient|InvokeClient)\s*\(/.exec(line);
+    if (remoteMatch) index.remotes.push({ name: remoteMatch[1], line: lineNum, method: remoteMatch[2] });
+
+    // UI sections
+    const uiMatch = /:\s*(Page|Section|Category|Toggle|Button|Slider|Dropdown|Paragraph|Label)\s*\(/.exec(line);
+    if (uiMatch) {
+      const nameMatch = /Name\s*=\s*["']([^"']+)["']/.exec(line);
+      index.uiSections.push({ name: nameMatch ? nameMatch[1] : '?', line: lineNum, type: uiMatch[1] });
+    }
+
+    // Comments
+    const commentMatch = /^\s*--\s*(.+)$/.exec(line);
+    if (commentMatch) index.comments.push({ text: commentMatch[1].trim(), line: lineNum });
+
+    // Keywords
+    const svcMatch = /game\s*:\s*GetService\s*\(\s*["']([^"']+)["']/.exec(line);
+    if (svcMatch) index.keywords.push({ type: 'service', text: svcMatch[0], line: lineNum });
+    if (/require\s*\(/.test(line)) index.keywords.push({ type: 'require', text: line.trim().slice(0, 80), line: lineNum });
+    if (/\b(while|for|repeat)\s+\w+/.test(line)) index.keywords.push({ type: 'loop', text: line.trim().slice(0, 80), line: lineNum });
+  }
+
+  // Score matches against query
+  const queryTokens = queryStr
+    .split(/[\s_-]+/)
+    .flatMap(token => {
+      // Also split camelCase tokens
+      const camelSplit = token.split(/(?=[A-Z])/);
+      return camelSplit.length > 1 ? camelSplit.map(t => t.toLowerCase()) : [token.toLowerCase()];
+    })
+    .filter(t => t.length > 0);
+
+  const matches = [];
+
+  function scoreMatch(elementName, elementType) {
+    if (!elementName || !queryStr) return 0;
+    const nameLower = elementName.toLowerCase();
+    const queryLower = queryStr.toLowerCase();
+
+    // Exact match = 100
+    if (nameLower === queryLower) return 100;
+
+    // Substring match = 50
+    if (nameLower.includes(queryLower)) return 50;
+    if (queryLower.includes(nameLower)) return 50;
+
+    // Token-based scoring
+    let tokenScore = 0;
+    let maxTokenScore = 0;
+    for (const token of queryTokens) {
+      // Exact token match in name
+      if (nameLower === token) { maxTokenScore = Math.max(maxTokenScore, 100); continue; }
+      // Token is substring of name
+      if (nameLower.includes(token)) { maxTokenScore = Math.max(maxTokenScore, 50); continue; }
+      // Name is substring of token
+      if (token.includes(nameLower)) { maxTokenScore = Math.max(maxTokenScore, 50); continue; }
+      // CamelCase word match
+      const camelWords = nameLower.split(/(?=[A-Z])/);
+      for (const cw of camelWords) {
+        if (cw.includes(token) || token.includes(cw)) {
+          maxTokenScore = Math.max(maxTokenScore, 75);
+        }
+      }
+    }
+
+    // Partial substring overlap bonus (bounded: max 3-char prefix match)
+    if (maxTokenScore === 0) {
+      for (const token of queryTokens) {
+        const prefixLen = Math.min(4, token.length, nameLower.length);
+        if (prefixLen >= 3 && nameLower.substring(0, prefixLen) === token.substring(0, prefixLen)) {
+          maxTokenScore = 25;
+          break;
+        }
+      }
+    }
+
+    return maxTokenScore;
+  }
+
+  function getContext(lineNum) {
+    const idx = lineNum - 1;
+    const before = [];
+    for (let i = Math.max(0, idx - contextLines); i < idx; i++) {
+      before.push(lines[i]);
+    }
+    const after = [];
+    for (let i = idx + 1; i < Math.min(lines.length, idx + 1 + contextLines); i++) {
+      after.push(lines[i]);
+    }
+    return { before, line: lines[idx] || '', after };
+  }
+
+  // Score functions
+  for (const fn of index.functions) {
+    const score = scoreMatch(fn.name, 'function');
+    if (score > 0) {
+      matches.push({ type: 'function', name: fn.name, line: fn.line, score, context: getContext(fn.line) });
+    }
+  }
+
+  // Score variables
+  for (const v of index.variables) {
+    const score = scoreMatch(v.name, 'variable');
+    if (score > 0) {
+      matches.push({ type: 'variable', name: v.name, line: v.line, score, context: getContext(v.line) });
+    }
+  }
+
+  // Score remotes
+  for (const r of index.remotes) {
+    const score = scoreMatch(r.name, 'remote');
+    if (score > 0) {
+      matches.push({ type: 'remote', name: r.name, line: r.line, score, context: getContext(r.line) });
+    }
+  }
+
+  // Score UI sections
+  for (const s of index.uiSections) {
+    const score = scoreMatch(s.name, 'ui_section');
+    if (score > 0) {
+      matches.push({ type: 'ui_section', name: s.name, line: s.line, score, context: getContext(s.line) });
+    }
+  }
+
+  // Score comments (search comment text)
+  for (const c of index.comments) {
+    const score = scoreMatch(c.text, 'comment');
+    if (score > 0) {
+      matches.push({ type: 'comment', name: c.text.slice(0, 60), line: c.line, score, context: getContext(c.line) });
+    }
+  }
+
+  // Score keywords
+  for (const k of index.keywords) {
+    const score = scoreMatch(k.text, 'keyword');
+    if (score > 0) {
+      matches.push({ type: 'keyword', name: k.text.slice(0, 60), line: k.line, score, context: getContext(k.line) });
+    }
+  }
+
+  // Sort by score descending
+  matches.sort((a, b) => b.score - a.score || a.line - b.line);
+
+  return {
+    filePath: toPosix(filePath),
+    query: queryStr,
+    totalMatches: matches.length,
+    matches: matches.slice(0, options.maxResults || 50),
+    index: {
+      functionCount: index.functions.length,
+      variableCount: index.variables.length,
+      remoteCount: index.remotes.length,
+      uiSectionCount: index.uiSections.length,
+    },
+  };
+}
+
+// ── Extract Remote Details (Calls + Handlers) ────────────────────────────────
+
+/**
+ * Enhanced version of extractRemotePayloads that adds handler-side information.
+ * Maps remote calls to their potential handlers, detects pcall usage.
+ */
+export function extractRemoteDetails(text, filePath = '') {
+  const source = String(text || '');
+  const lines = source.split(/\r?\n/);
+
+  // Use extractRemotePayloads for the call-side
+  const base = extractRemotePayloads(text, filePath);
+
+  // Build a map of remote variable names to their definitions
+  const remoteDefs = new Map(); // name -> { type, line, varName }
+  const remoteCalls = new Map(); // varName -> [call info]
+  const remoteHandlers = new Map(); // varName -> [handler info]
+
+  // 1. Find remote definitions (RemoteEvent, RemoteFunction)
+  const defPatterns = [
+    { re: /local\s+(\w[\w.]*)\s*=\s*(?:.*?):(?:RemoteEvent|RemoteFunction)\s*\(\s*["']([^"']+)["']/, type: 'named' },
+    { re: /local\s+(\w[\w.]*)\s*=\s*(?:ReplicatedStorage|game)\s*:\s*(?:WaitForChild|FindFirstChild)\s*\(\s*["']([^"']+)["']\s*\)/, type: 'waitforchild' },
+    { re: /local\s+(\w[\w.]*)\s*=\s*["']([^"']+)["']\s*:\s*(?:RemoteEvent|RemoteFunction)/, type: 'reverse' },
+  ];
+
+  for (let i = 0; i < lines.length; i++) {
+    const line = lines[i];
+    for (const dp of defPatterns) {
+      const m = dp.re.exec(line);
+      if (m) {
+        const varName = m[1];
+        const remoteName = m[2];
+        const kind = /RemoteFunction/.test(line) ? 'RemoteFunction' : 'RemoteEvent';
+        remoteDefs.set(varName, { name: remoteName, kind, line: i + 1, varName });
+        break;
+      }
+    }
+  }
+
+  // 2. Find all remote calls with pcall detection
+  const callRe = /(\w[\w.]*)\s*:\s*(FireServer|InvokeServer|FireClient|InvokeClient)\s*\(/g;
+  for (let i = 0; i < lines.length; i++) {
+    const line = lines[i];
+    let callMatch;
+    // Reset lastIndex since we reuse the regex
+    const lineCallRe = /(\w[\w.]*)\s*:\s*(FireServer|InvokeServer|FireClient|InvokeClient)\s*\(/;
+    callMatch = lineCallRe.exec(line);
+    if (callMatch) {
+      const varName = callMatch[1];
+      const method = callMatch[2];
+
+      // Check for pcall on this line or in surrounding context
+      let hasPcall = false;
+      if (/\bpcall\b/.test(line)) {
+        hasPcall = true;
+      } else {
+        // Check up to 3 lines before
+        for (let j = Math.max(0, i - 3); j < i; j++) {
+          if (/\bpcall\s*\(/.test(lines[j])) {
+            hasPcall = true;
+            break;
+          }
+        }
+      }
+
+      // Determine payload style
+      const payloadStr = line.substring(callMatch.index + callMatch[0].length).trim();
+      let payloadStyle = 'empty';
+      if (payloadStr.startsWith('{')) {
+        payloadStyle = 'table';
+      } else if (payloadStr && payloadStr !== ')') {
+        payloadStyle = 'positional';
+      }
+
+      const callInfo = {
+        line: i + 1,
+        method,
+        hasPcall,
+        payloadStyle,
+        snippet: line.trim().slice(0, 120),
+      };
+
+      if (!remoteCalls.has(varName)) remoteCalls.set(varName, []);
+      remoteCalls.get(varName).push(callInfo);
+    }
+  }
+
+  // 3. Find handlers (OnServerEvent, OnClientEvent, OnServerInvoke, OnClientInvoke)
+  const handlerPatterns = [
+    { re: /(\w[\w.]*)\s*\.\s*(OnServerEvent)\s*:\s*Connect\s*\(/, type: 'OnServerEvent' },
+    { re: /(\w[\w.]*)\s*\.\s*(OnClientEvent)\s*:\s*Connect\s*\(/, type: 'OnClientEvent' },
+    { re: /(\w[\w.]*)\s*\.\s*(OnServerInvoke)\s*\s*=\s*/, type: 'OnServerInvoke' },
+    { re: /(\w[\w.]*)\s*\.\s*(OnClientInvoke)\s*\s*=\s*/, type: 'OnClientInvoke' },
+  ];
+
+  for (let i = 0; i < lines.length; i++) {
+    const line = lines[i];
+    for (const hp of handlerPatterns) {
+      const m = hp.re.exec(line);
+      if (m) {
+        const varName = m[1];
+        const handlerType = hp.type;
+        const handlerInfo = {
+          line: i + 1,
+          type: handlerType,
+          snippet: line.trim().slice(0, 120),
+        };
+        if (!remoteHandlers.has(varName)) remoteHandlers.set(varName, []);
+        remoteHandlers.get(varName).push(handlerInfo);
+      }
+    }
+  }
+
+  // 4. Build unified remote list
+  const allVarNames = new Set([
+    ...remoteDefs.keys(),
+    ...remoteCalls.keys(),
+    ...remoteHandlers.keys(),
+  ]);
+
+  const remotes = [];
+  const orphans = [];
+
+  for (const varName of allVarNames) {
+    const def = remoteDefs.get(varName);
+    const calls = remoteCalls.get(varName) || [];
+    const handlers = remoteHandlers.get(varName) || [];
+    const isOrphaned = calls.length > 0 && handlers.length === 0;
+
+    // Determine kind
+    let kind = 'unknown';
+    if (def) {
+      kind = def.kind;
+    } else if (calls.some(c => c.method === 'InvokeServer' || c.method === 'InvokeClient')) {
+      kind = 'RemoteFunction';
+    } else if (calls.length > 0) {
+      kind = 'RemoteEvent';
+    }
+
+    // Calculate pcall coverage
+    const totalCalls = calls.length;
+    const pcallCalls = calls.filter(c => c.hasPcall).length;
+    const pcallCoverage = totalCalls > 0 ? Math.round((pcallCalls / totalCalls) * 100) : 100;
+
+    const remoteName = def ? def.name : varName;
+
+    remotes.push({
+      name: remoteName,
+      kind,
+      calls,
+      handlers,
+      isOrphaned,
+      pcallCoverage,
+    });
+
+    if (isOrphaned) {
+      orphans.push(remoteName);
+    }
+  }
+
+  // Sort by name
+  remotes.sort((a, b) => a.name.localeCompare(b.name));
+
+  // Summary
+  const allCalls = remotes.flatMap(r => r.calls);
+  const totalCalls = allCalls.length;
+  const withPcall = allCalls.filter(c => c.hasPcall).length;
+  const uniqueRemotes = remotes.length;
+  const withHandlers = remotes.filter(r => r.handlers.length > 0).length;
+
+  return {
+    filePath: toPosix(filePath),
+    summary: {
+      totalCalls,
+      uniqueRemotes,
+      withPcall,
+      withoutPcall: totalCalls - withPcall,
+      withHandlers,
+      orphanedRemotes: orphans.length,
+    },
+    remotes,
+    orphans,
+  };
+}
