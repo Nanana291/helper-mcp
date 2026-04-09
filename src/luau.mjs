@@ -2248,3 +2248,591 @@ export function scanLuauLint(root) {
     files: results,
   };
 }
+
+// ── Game API Surface Map ─────────────────────────────────────────────────────
+
+/**
+ * Extracts the full communication surface of a game script:
+ * remote names, payload keys, attribute reads/writes, workspace object references,
+ * service usage, custom functions, and config structures.
+ */
+export function extractGameApiMap(text, filePath = '') {
+  const lines = text.split(/\r?\n/);
+  const api = {
+    remotes: { fire: [], invoke: [], definitions: [] },
+    attributes: { get: [], set: [], patterns: [] },
+    workspace: { live: [], other: [], referenced: [] },
+    services: new Set(),
+    functions: [],
+    configKeys: [],
+    constants: [],
+  };
+
+  for (let i = 0; i < lines.length; i++) {
+    const line = lines[i];
+    const trimmed = line.trim();
+
+    // 1. Remote calls
+    const fireMatch = trimmed.match(/(\w[\w.]*)\s*:\s*(FireServer|InvokeServer|FireClient|FireAllClients)\s*\(/);
+    if (fireMatch) {
+      const entry = { name: fireMatch[1], method: fireMatch[2], line: i + 1 };
+      api.remotes.fire.push(entry);
+      // Extract payload keys
+      const payloadExtract = extractPayloadKeys(trimmed);
+      if (payloadExtract.length > 0) entry.keys = payloadExtract;
+    }
+    const invokeMatch = trimmed.match(/(\w[\w.]*)\s*:\s*(InvokeServer|InvokeClient)\s*\(/);
+    if (invokeMatch && !fireMatch) {
+      api.remotes.invoke.push({ name: invokeMatch[1], method: invokeMatch[2], line: i + 1 });
+    }
+    // Remote definitions
+    const remoteDefMatch = trimmed.match(/:\s*(RemoteEvent|RemoteFunction)\s*\(\s*["']([^"']+)["']/);
+    if (remoteDefMatch) {
+      api.remotes.definitions.push({ type: remoteDefMatch[1], name: remoteDefMatch[2], line: i + 1 });
+    }
+
+    // 2. Attribute access
+    const attrGetMatch = trimmed.match(/(\w+)\s*:\s*GetAttribute\s*\(\s*["']([^"']+)["']\s*\)/);
+    if (attrGetMatch) {
+      api.attributes.get.push({ key: attrGetMatch[2], source: attrGetMatch[1], line: i + 1 });
+    }
+    const attrSetMatch = trimmed.match(/(\w+)\s*:\s*SetAttribute\s*\(\s*["']([^"']+)["']\s*,/);
+    if (attrSetMatch) {
+      api.attributes.set.push({ key: attrSetMatch[2], source: attrSetMatch[1], line: i + 1 });
+    }
+
+    // 3. Workspace references (Live folder, etc)
+    const liveMatch = trimmed.match(/workspace\s*\.Live\s*:\s*GetChildren\s*\(\)/);
+    if (liveMatch) {
+      api.workspace.live.push({ line: i + 1 });
+    }
+    const workspaceRefMatch = trimmed.match(/workspace\s*\.(\w[\w.]*)/);
+    if (workspaceRefMatch && !/workspace\s*\./.test(trimmed.substring(0, trimmed.indexOf(workspaceRefMatch[0]))).includes('workspace.')) {
+      const ref = workspaceRefMatch[1];
+      if (!['CurrentCamera'].includes(ref)) {
+        api.workspace.referenced.push({ path: ref, line: i + 1 });
+      }
+    }
+
+    // 4. Services
+    const serviceMatch = trimmed.match(/game\s*:\s*GetService\s*\(\s*["']([^"']+)["']\s*\)/);
+    if (serviceMatch) {
+      api.services.add(serviceMatch[1]);
+    }
+
+    // 5. Function definitions
+    const funcMatch = trimmed.match(/(?:local\s+)?function\s+(\w[\w.:]*)\s*\(/);
+    if (funcMatch && !/function\s*\(/.test(trimmed)) {
+      api.functions.push({ name: funcMatch[1], line: i + 1 });
+    }
+
+    // 6. Config/Option keys
+    const configMatch = trimmed.match(/(?:Options|Toggles|Flags|Library\.Flags)\s*\[\s*["']([^"']+)["']\s*\]/);
+    if (configMatch) {
+      api.configKeys.push({ key: configMatch[1], line: i + 1 });
+    }
+
+    // 7. Constants
+    const constMatch = trimmed.match(/local\s+([A-Z_][A-Z0-9_]*)\s*=\s*(.+)/);
+    if (constMatch && constMatch[1] !== 'A' && constMatch[1].length > 2) {
+      api.constants.push({ name: constMatch[1], value: constMatch[2].trim().slice(0, 80), line: i + 1 });
+    }
+  }
+
+  // Deduplicate
+  api.attributes.patterns = summarizeAttributePatterns(api.attributes.get, api.attributes.set);
+  api.workspace.referenced = deduplicateByKey(api.workspace.referenced, 'path');
+  api.configKeys = deduplicateByKey(api.configKeys, 'key');
+  api.services = [...api.services].sort();
+  api.functions = api.functions.slice(0, 50); // cap
+
+  return {
+    filePath: toPosix(filePath),
+    summary: {
+      remoteCallCount: api.remotes.fire.length + api.remotes.invoke.length,
+      uniqueRemotes: new Set(api.remotes.fire.map(r => r.name).concat(api.remotes.invoke.map(r => r.name))).size,
+      attributeCount: new Set(api.attributes.get.map(a => a.key).concat(api.attributes.set.map(a => a.key))).size,
+      serviceCount: api.services.length,
+      functionCount: api.functions.length,
+      configKeyCount: api.configKeys.length,
+      constantCount: api.constants.length,
+    },
+    api,
+  };
+}
+
+function extractPayloadKeys(line) {
+  const keys = [];
+  const keyRe = /(\w+)\s*=/g;
+  let m;
+  while ((m = keyRe.exec(line)) !== null) {
+    if (!['function', 'local', 'return', 'if', 'then', 'end', 'for', 'while', 'do'].includes(m[1])) {
+      keys.push(m[1]);
+    }
+  }
+  return [...new Set(keys)];
+}
+
+function summarizeAttributePatterns(gets, sets) {
+  const allKeys = new Set();
+  for (const a of gets) allKeys.add(a.key);
+  for (const a of sets) allKeys.add(a.key);
+  const patterns = [];
+  for (const key of allKeys) {
+    const getSources = gets.filter(a => a.key === key).map(a => a.source);
+    const setSources = sets.filter(a => a.key === key).map(a => a.source);
+    patterns.push({
+      key,
+      read: getSources.length > 0,
+      write: setSources.length > 0,
+      readBy: [...new Set(getSources)],
+      writtenBy: [...new Set(setSources)],
+    });
+  }
+  return patterns;
+}
+
+function deduplicateByKey(arr, keyField) {
+  const seen = new Set();
+  return arr.filter(item => {
+    if (seen.has(item[keyField])) return false;
+    seen.add(item[keyField]);
+    return true;
+  });
+}
+
+export function scanGameApi(root) {
+  const files = walkFiles(root, (filePath) => {
+    const ext = path.extname(filePath).toLowerCase();
+    return LUau_EXTENSIONS.has(ext);
+  });
+
+  const results = [];
+  for (const file of files) {
+    const text = readText(file);
+    if (!text) continue;
+    const relPath = toPosix(relative(root, file));
+    const map = extractGameApiMap(text, relPath);
+    if (map.summary.remoteCallCount > 0 || map.summary.attributeCount > 0) {
+      results.push(map);
+    }
+  }
+
+  return {
+    totalFiles: results.length,
+    files: results.map(r => ({
+      file: r.filePath,
+      summary: r.summary,
+      topRemotes: r.api.remotes.fire.slice(0, 10),
+      topAttributes: r.api.attributes.patterns.slice(0, 15),
+      services: r.api.services,
+    })),
+  };
+}
+
+// ── Feature Parity (V1 → V2) ─────────────────────────────────────────────────
+
+/**
+ * Generates a feature-by-feature comparison between a V1 and V2 script.
+ * Identifies preserved, modified, new, and missing features.
+ */
+export function analyzeFeatureParity(oldText, newText, oldPath = '', newPath = '') {
+  const oldApi = extractGameApiMap(oldText, oldPath);
+  const newApi = extractGameApiMap(newText, newPath);
+  const oldAnalysis = analyzeLuauText(oldText, oldPath);
+  const newAnalysis = analyzeLuauText(newText, newPath);
+
+  // Feature detection based on semantic patterns
+  const features = compareFeatureSets(oldText, newText);
+
+  // Remote parity
+  const oldRemotes = new Set(oldApi.api.remotes.fire.map(r => r.name));
+  const newRemotes = new Set(newApi.api.remotes.fire.map(r => r.name));
+  const lostRemotes = [...oldRemotes].filter(r => !newRemotes.has(r));
+  const addedRemotes = [...newRemotes].filter(r => !oldRemotes.has(r));
+
+  // Attribute parity
+  const oldAttrs = new Set(oldApi.api.attributes.get.map(a => a.key).concat(oldApi.api.attributes.set.map(a => a.key)));
+  const newAttrs = new Set(newApi.api.attributes.get.map(a => a.key).concat(newApi.api.attributes.set.map(a => a.key)));
+  const lostAttrs = [...oldAttrs].filter(a => !newAttrs.has(a));
+  const addedAttrs = [...newAttrs].filter(a => !oldAttrs.has(a));
+
+  // Config key parity
+  const oldConfigs = new Set(oldApi.api.configKeys.map(c => c.key));
+  const newConfigs = new Set(newApi.api.configKeys.map(c => c.key));
+  const lostConfigs = [...oldConfigs].filter(c => !newConfigs.has(c));
+  const addedConfigs = [...newConfigs].filter(c => !oldConfigs.has(c));
+
+  // Build parity table
+  const parity = features.map(f => ({
+    feature: f.name,
+    status: f.status, // 'preserved', 'modified', 'new', 'missing'
+    v1: f.v1 ? 'Yes' : 'No',
+    v2: f.v2 ? 'Yes' : 'No',
+    detail: f.detail || '',
+  }));
+
+  const preserved = parity.filter(f => f.status === 'preserved').length;
+  const modified = parity.filter(f => f.status === 'modified').length;
+  const newOnes = parity.filter(f => f.status === 'new').length;
+  const missing = parity.filter(f => f.status === 'missing').length;
+
+  return {
+    paths: { old: toPosix(oldPath), new: toPosix(newPath) },
+    summary: {
+      oldLines: oldAnalysis.summary.lineCount,
+      newLines: newAnalysis.summary.lineCount,
+      lineDelta: newAnalysis.summary.lineCount - oldAnalysis.summary.lineCount,
+      features: { total: parity.length, preserved, modified, new: newOnes, missing },
+      remotes: { lost: lostRemotes.length, added: addedRemotes.length },
+      attributes: { lost: lostAttrs.length, added: addedAttrs.length },
+      configKeys: { lost: lostConfigs.length, added: addedConfigs.length },
+    },
+    parity,
+    lostRemotes,
+    addedRemotes,
+    lostAttrs,
+    addedAttrs,
+    lostConfigs,
+    addedConfigs,
+  };
+}
+
+function compareFeatureSets(oldText, newText) {
+  const features = [];
+  const oldLower = oldText.toLowerCase();
+  const newLower = newText.toLowerCase();
+
+  // Combat features
+  addFeature(features, 'Auto Block', oldLower, newLower, ['autoblock', 'auto.block', 'block.range'], ['autoblock', 'auto.block', 'block.range']);
+  addFeature(features, 'Auto Counter', oldLower, newLower, ['counter', 'countermode', 'auto.counter'], ['counter', 'countermode', 'auto.counter']);
+  addFeature(features, 'Auto Ultimate', oldLower, newLower, ['autoult', 'auto.ult', 'auto.ultimate'], ['autoult', 'auto.ult', 'auto.ultimate']);
+  addFeature(features, 'Auto Evasive', oldLower, newLower, ['autoevasive', 'auto.evasive', 'ragdoll'], ['autoevasive', 'auto.evasive', 'ragdoll']);
+  addFeature(features, 'Auto Farm Players', oldLower, newLower, ['farm', 'farmp', 'auto.farm'], ['farm', 'farmp', 'auto.farm']);
+  addFeature(features, 'Orbit Mode', oldLower, newLower, ['orbit', 'orbitspeed', 'orbitdist'], ['orbit', 'orbitspeed', 'orbitdist']);
+  addFeature(features, 'Saved Positions', oldLower, newLower, ['savepos', 'savedposition', 'save.position'], ['savepos', 'savedposition', 'save.position']);
+  addFeature(features, 'Escape / Low HP TP', oldLower, newLower, ['escape', 'escapehp', 'escape.on'], ['escape', 'escapehp', 'escape.on']);
+  addFeature(features, 'Auto Skills', oldLower, newLower, ['autoskill', 'auto.skill', 'skilltouse'], ['autoskill', 'auto.skill', 'skilltouse']);
+  addFeature(features, 'Character Select', oldLower, newLower, ['characterselect', 'autochangechar', 'change.character'], ['characterselect', 'autochangechar', 'change.character']);
+  addFeature(features, 'WalkSpeed', oldLower, newLower, ['walkspeed', 'setws', 'set.walk'], ['walkspeed', 'setws', 'set.walk']);
+  addFeature(features, 'JumpPower', oldLower, newLower, ['jumppower', 'setjp', 'set.jump'], ['jumppower', 'setjp', 'set.jump']);
+  addFeature(features, 'Teleport Tween', oldLower, newLower, ['tween', 'tweenspeed', 'teleportmode'], ['tween', 'tweenspeed', 'teleportmode']);
+  addFeature(features, 'Return to Spawn', oldLower, newLower, ['return', 'returntospawn', 'return.to'], ['return', 'returntospawn', 'return.to']);
+  addFeature(features, 'Stop on Damage', oldLower, newLower, ['stopon', 'stop.damage', 'stoponhit'], ['stopon', 'stop.damage', 'stoponhit']);
+  addFeature(features, 'Target Priority', oldLower, newLower, ['targetpriority', 'target.priority', 'priority'], ['targetpriority', 'target.priority', 'priority']);
+  addFeature(features, 'Face Target', oldLower, newLower, ['facetarget', 'face.target', 'faceto'], ['facetarget', 'face.target', 'faceto']);
+  addFeature(features, 'Status Paragraphs', oldLower, newLower, ['paragraph', 'settext', 'buildstatus', 'imp-hub-status'], ['paragraph', 'settext', 'buildstatus', 'imp-hub-status']);
+
+  return features;
+}
+
+function addFeature(list, name, oldText, newText, oldPatterns, newPatterns) {
+  const v1 = oldPatterns.some(p => oldText.includes(p));
+  const v2 = newPatterns.some(p => newText.includes(p));
+  let status = 'missing';
+  let detail = '';
+  if (v1 && v2) { status = 'preserved'; detail = 'Present in both versions.'; }
+  else if (!v1 && v2) { status = 'new'; detail = 'Added in V2.'; }
+  else if (v1 && !v2) { status = 'missing'; detail = 'Present in V1 but NOT in V2.'; }
+  list.push({ name, v1, v2, status, detail });
+}
+
+// ── Character Lifecycle / Respawn Check ──────────────────────────────────────
+
+/**
+ * Analyzes how a Luau script handles character death, respawn, and callback reconnection.
+ */
+export function checkRespawnLifecycle(text, filePath = '') {
+  const lines = text.split(/\r?\n/);
+  const issues = [];
+  const findings = {
+    characterAddedHandler: false,
+    characterVariableUpdate: false,
+    rootNullChecks: 0,
+    humanoidNullChecks: 0,
+    orphanedConnections: false,
+    connectionOwnership: [],
+    respawnSafeLoops: 0,
+    unsafeLoops: 0,
+    reconnectionPatterns: [],
+  };
+
+  let hasCharAdded = false;
+  let hasCharUpdate = false;
+
+  for (let i = 0; i < lines.length; i++) {
+    const line = lines[i];
+    const trimmed = line.trim();
+
+    // CharacterAdded connection
+    if (/CharacterAdded\s*:\s*Connect\s*\(/.test(trimmed)) {
+      hasCharAdded = true;
+      findings.characterAddedHandler = true;
+      // Check if the callback updates the Character variable
+      const callbackLines = lines.slice(i, Math.min(i + 8, lines.length)).join('\n');
+      if (/Character\s*=\s*c\b/.test(callbackLines) || /Character\s*=\s*newChar/.test(callbackLines)) {
+        hasCharUpdate = true;
+        findings.characterVariableUpdate = true;
+        findings.reconnectionPatterns.push({ type: 'full-rebind', line: i + 1, detail: 'Character variable updated on CharacterAdded' });
+      } else {
+        findings.reconnectionPatterns.push({ type: 'event-only', line: i + 1, detail: 'CharacterAdded fires but Character variable may not be updated' });
+      }
+    }
+
+    // Null checks for HumanoidRootPart
+    if (/FindFirstChild\s*\(\s*["']HumanoidRootPart["']\s*\)/.test(trimmed)) {
+      findings.rootNullChecks++;
+    }
+    // Null checks for Humanoid
+    if (/FindFirstChild\s*\(\s*["']Humanoid["']\s*\)/.test(trimmed)) {
+      findings.humanoidNullChecks++;
+    }
+    if (/FindFirstChildOfClass\s*\(\s*["']Humanoid["']\s*\)/.test(trimmed)) {
+      findings.humanoidNullChecks++;
+    }
+
+    // Loops without respawn safety
+    if (/while\s+/.test(trimmed) && /task\s*\.\s*wait/.test(trimmed)) {
+      // Check if loop body has Character/HumanoidRootPart validation
+      const loopBody = lines.slice(i, Math.min(i + 15, lines.length)).join('\n');
+      if (/FindFirstChild.*HumanoidRootPart/.test(loopBody) || /Character\s*&&/.test(loopBody)) {
+        findings.respawnSafeLoops++;
+      } else {
+        findings.unsafeLoops++;
+        issues.push({ line: i + 1, severity: 'warning', rule: 'respawn-unsafe-loop', message: 'Loop may not revalidate Character after respawn.' });
+      }
+    }
+
+    // Connection ownership tracking
+    if (/:\s*Connect\s*\(/.test(trimmed)) {
+      findings.connectionOwnership.push({ line: i + 1, text: trimmed.slice(0, 100) });
+    }
+  }
+
+  // Check for orphaned connections (no Disconnect or cleanup)
+  if (findings.connectionOwnership.length > 3 && !/:Disconnect/.test(text) && !/task\.cancel/.test(text)) {
+    findings.orphanedConnections = true;
+    issues.push({ line: 0, severity: 'info', rule: 'orphaned-connections', message: `${findings.connectionOwnership.length} connections created but no Disconnect/cleanup found.` });
+  }
+
+  // Initial Character acquisition
+  const hasInitialChar = /Character\s*=\s*Plr\.Character/.test(text) || /Character\s*=\s*LocalPlayer\.Character/.test(text);
+  const hasWaitForChar = /CharacterAdded\s*:\s*Wait\s*\(\)/.test(text);
+
+  if (!hasCharAdded && !hasWaitForChar) {
+    issues.push({ line: 0, severity: 'warning', rule: 'no-respawn-handler', message: 'No CharacterAdded handler — script will break after first respawn.' });
+  }
+
+  if (hasCharAdded && !hasCharUpdate) {
+    issues.push({ line: 0, severity: 'warning', rule: 'partial-rebind', message: 'CharacterAdded handler exists but Character variable may not be updated.' });
+  }
+
+  const bySeverity = { error: 0, warning: 0, info: 0 };
+  for (const issue of issues) {
+    bySeverity[issue.severity] = (bySeverity[issue.severity] || 0) + 1;
+  }
+
+  const verdict = bySeverity.error > 0 ? 'FAIL' : bySeverity.warning > 0 ? 'WARN' : 'PASS';
+
+  return {
+    filePath: toPosix(filePath),
+    verdict,
+    findings: {
+      ...findings,
+      hasInitialChar,
+      hasWaitForChar,
+      hasCharAdded,
+      hasCharUpdate,
+      totalConnections: findings.connectionOwnership.length,
+    },
+    issues,
+    bySeverity,
+  };
+}
+
+export function scanRespawnChecks(root) {
+  const files = walkFiles(root, (filePath) => {
+    const ext = path.extname(filePath).toLowerCase();
+    return LUau_EXTENSIONS.has(ext);
+  });
+
+  const results = [];
+  for (const file of files) {
+    const text = readText(file);
+    if (!text) continue;
+    const relPath = toPosix(relative(root, file));
+    const check = checkRespawnLifecycle(text, relPath);
+    if (check.verdict !== 'PASS' || check.issues.length > 0) {
+      results.push(check);
+    }
+  }
+
+  results.sort((a, b) => {
+    const order = { FAIL: 0, WARN: 1, PASS: 2 };
+    return (order[a.verdict] || 2) - (order[b.verdict] || 2);
+  });
+
+  return {
+    totalFiles: results.length,
+    files: results,
+  };
+}
+
+// ── Executor Compatibility ───────────────────────────────────────────────────
+
+/**
+ * Checks a Luau script for executor-specific APIs and compatibility.
+ * Maps detected APIs to known executor support levels.
+ */
+export function checkExecutorCompat(text, filePath = '') {
+  const lines = text.split(/\r?\n/);
+  const source = text;
+
+  // API -> executor support matrix
+  const apiMatrix = {
+    // Universal
+    'loadstring': { support: ['Delta', 'Wave', 'Solara', 'MacSploit', 'Codex', 'Oxygen'], severity: 'info', category: 'core' },
+    'getgenv': { support: ['Delta', 'Wave', 'Solara', 'MacSploit', 'Codex', 'Oxygen'], severity: 'info', category: 'core' },
+    'cloneref': { support: ['Delta', 'Wave', 'Solara', 'MacSploit', 'Codex', 'Oxygen'], severity: 'info', category: 'core' },
+    'setclipboard': { support: ['Delta', 'Wave', 'Solara', 'MacSploit', 'Codex'], severity: 'info', category: 'utility' },
+    'toclipboard': { support: ['Solara', 'MacSploit', 'Oxygen'], severity: 'info', category: 'utility' },
+    'identifyexecutor': { support: ['Delta', 'Wave', 'Solara', 'MacSploit', 'Codex', 'Oxygen'], severity: 'info', category: 'detection' },
+    'getexecutorname': { support: ['Delta', 'Wave', 'Solara'], severity: 'info', category: 'detection' },
+    // HTTP
+    'http_request': { support: ['Delta', 'Wave', 'Solara'], severity: 'warning', category: 'http' },
+    'syn.request': { support: ['Delta'], severity: 'warning', category: 'http-syn' },
+    'fluxus.request': { support: ['Fluxus'], severity: 'warning', category: 'http-executor' },
+    'request': { support: ['Delta', 'Wave', 'Solara', 'Codex'], severity: 'info', category: 'http' },
+    // File
+    'readfile': { support: ['Delta', 'Wave', 'Solara'], severity: 'info', category: 'file' },
+    'writefile': { support: ['Delta', 'Wave', 'Solara'], severity: 'info', category: 'file' },
+    'isfile': { support: ['Delta', 'Wave', 'Solara'], severity: 'info', category: 'file' },
+    'makefolder': { support: ['Delta', 'Wave', 'Solara'], severity: 'info', category: 'file' },
+    'isfolder': { support: ['Delta', 'Wave', 'Solara'], severity: 'info', category: 'file' },
+    'delfolder': { support: ['Delta', 'Wave', 'Solara'], severity: 'info', category: 'file' },
+    'delfile': { support: ['Delta', 'Wave', 'Solara'], severity: 'info', category: 'file' },
+    'listfiles': { support: ['Delta', 'Wave', 'Solara'], severity: 'info', category: 'file' },
+    'appendfile': { support: ['Delta', 'Wave', 'Solara'], severity: 'info', category: 'file' },
+    // Drawing
+    'Drawing.new': { support: ['Delta', 'Wave', 'Solara', 'MacSploit', 'Codex'], severity: 'info', category: 'drawing' },
+    'drawing': { support: ['Delta', 'Wave', 'Solara'], severity: 'info', category: 'drawing' },
+    // Window
+    'setfpscap': { support: ['Delta', 'Wave', 'Solara'], severity: 'info', category: 'performance' },
+    'fpscap': { support: ['Delta', 'Wave'], severity: 'info', category: 'performance' },
+    // Debug
+    'hookfunction': { support: ['Delta'], severity: 'warning', category: 'debug' },
+    'getgc': { support: ['Delta'], severity: 'warning', category: 'debug' },
+    'getinstances': { support: ['Delta', 'Wave'], severity: 'info', category: 'debug' },
+    'getnilinstances': { support: ['Delta', 'Wave'], severity: 'info', category: 'debug' },
+    // Environment
+    'getrenv': { support: ['Delta'], severity: 'warning', category: 'env' },
+    'getrunningscripts': { support: ['Delta'], severity: 'warning', category: 'env' },
+    'checkcaller': { support: ['Delta'], severity: 'warning', category: 'env' },
+    // Mobile
+    'mouse1click': { support: ['Delta', 'Wave', 'Solara'], severity: 'info', category: 'input' },
+    'mouse2click': { support: ['Delta', 'Wave', 'Solara'], severity: 'info', category: 'input' },
+    'keypress': { support: ['Delta', 'Wave', 'Solara'], severity: 'info', category: 'input' },
+    'keyrelease': { support: ['Delta', 'Wave', 'Solara'], severity: 'info', category: 'input' },
+  };
+
+  const detections = [];
+  const executors = {};
+  const blocked = [];
+
+  for (const [api, info] of Object.entries(apiMatrix)) {
+    const escapedApi = api.replace(/\./g, '\\.');
+    const re = new RegExp(`\\b${escapedApi}\\b`);
+    if (re.test(source)) {
+      detections.push({ api, ...info });
+      for (const exec of info.support) {
+        if (!executors[exec]) executors[exec] = { total: 0, warnings: 0, blocked: 0 };
+        executors[exec].total++;
+        if (info.severity === 'warning') executors[exec].warnings++;
+      }
+    }
+  }
+
+  // Additional checks
+  // game:HttpGet — universal
+  if (/game\s*:\s*HttpGet\b/.test(source)) {
+    detections.push({ api: 'game:HttpGet', support: ['all'], severity: 'info', category: 'core' });
+  }
+
+  // queue_on_teleport — Delta/Wave only
+  if (/queue_on_teleport/.test(source)) {
+    detections.push({ api: 'queue_on_teleport', support: ['Delta', 'Wave'], severity: 'warning', category: 'teleport' });
+    for (const exec of ['Delta', 'Wave']) {
+      if (executors[exec]) executors[exec].total++;
+    }
+  }
+
+  // Calculate compatibility scores
+  const compatReport = Object.entries(executors).map(([name, stats]) => {
+    const supported = detections.filter(d => d.support.includes('all') || d.support.includes(name));
+    const unsupported = detections.filter(d => !d.support.includes('all') && !d.support.includes(name));
+    const score = stats.total > 0 ? Math.round(((stats.total - stats.warnings) / stats.total) * 100) : 100;
+    return {
+      name,
+      score,
+      apiCount: stats.total,
+      warnings: stats.warnings,
+      missingApis: unsupported.map(d => d.api),
+      status: score >= 90 ? 'Full' : score >= 70 ? 'Partial' : 'Limited',
+    };
+  });
+
+  compatReport.sort((a, b) => b.score - a.score);
+
+  // Identify blocking APIs (used but not supported by common executors)
+  for (const det of detections) {
+    if (det.severity === 'warning') {
+      const unsupported = ['all', 'Delta', 'Wave', 'Solara', 'Codex'].filter(e => !det.support.includes(e));
+      if (unsupported.length > 0) {
+        blocked.push({ api: det.api, support: det.support, category: det.category });
+      }
+    }
+  }
+
+  return {
+    filePath: toPosix(filePath),
+    summary: {
+      totalDetections: detections.length,
+      executorCount: compatReport.length,
+      blockedApis: blocked.length,
+      universal: detections.filter(d => d.support.includes('all')).length,
+      delta: compatReport.find(e => e.name === 'Delta'),
+      wave: compatReport.find(e => e.name === 'Wave'),
+      solara: compatReport.find(e => e.name === 'Solara'),
+    },
+    detections: detections.map(d => ({ api: d.api, category: d.category, severity: d.severity })),
+    compat: compatReport,
+    blocked,
+  };
+}
+
+export function scanExecutorCompat(root) {
+  const files = walkFiles(root, (filePath) => {
+    const ext = path.extname(filePath).toLowerCase();
+    return LUau_EXTENSIONS.has(ext);
+  });
+
+  const results = [];
+  for (const file of files) {
+    const text = readText(file);
+    if (!text) continue;
+    const relPath = toPosix(relative(root, file));
+    const check = checkExecutorCompat(text, relPath);
+    if (check.summary.totalDetections > 0) {
+      results.push(check);
+    }
+  }
+
+  return {
+    totalFiles: results.length,
+    files: results.map(r => ({
+      file: r.filePath,
+      summary: r.summary,
+      topCompat: r.compat.slice(0, 6),
+    })),
+  };
+}

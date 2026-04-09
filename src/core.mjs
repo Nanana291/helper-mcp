@@ -60,6 +60,13 @@ import {
   lintLuauText,
   scanRemotePayloads,
   scanLuauLint,
+  extractGameApiMap,
+  scanGameApi,
+  analyzeFeatureParity,
+  checkRespawnLifecycle,
+  scanRespawnChecks,
+  checkExecutorCompat,
+  scanExecutorCompat,
   bridgeLuauCommandResult,
   writeLuauHotfixSnapshots,
 } from './luau.mjs';
@@ -1014,6 +1021,36 @@ const toolDefinitions = [
     },
     additionalProperties: false,
   }),
+  toolDefinition('luau.api_map', ['luau.api_map', 'luau_api_map'], 'Extract game API surface: remotes, attributes, workspace refs, services, config keys, constants.', {
+    type: 'object',
+    properties: {
+      filePath: { type: 'string', description: 'Specific file to analyze. If omitted, scans all Luau files.' },
+    },
+    additionalProperties: false,
+  }),
+  toolDefinition('luau.feature_parity', ['luau.feature_parity', 'luau_feature_parity'], 'Feature-by-feature V1→V2 comparison: preserved, modified, new, and missing features.', {
+    type: 'object',
+    properties: {
+      oldPath: { type: 'string' },
+      newPath: { type: 'string' },
+    },
+    required: ['oldPath', 'newPath'],
+    additionalProperties: false,
+  }),
+  toolDefinition('luau.respawn_check', ['luau.respawn_check', 'luau_respawn_check'], 'Character lifecycle analysis: respawn handlers, callback reconnection, loop safety, orphaned connections.', {
+    type: 'object',
+    properties: {
+      filePath: { type: 'string', description: 'Specific file to check. If omitted, scans all Luau files.' },
+    },
+    additionalProperties: false,
+  }),
+  toolDefinition('luau.compat', ['luau.compat', 'luau_compat'], 'Executor compatibility checker: maps APIs to Delta/Wave/Solara/Codex support levels.', {
+    type: 'object',
+    properties: {
+      filePath: { type: 'string', description: 'Specific file to check. If omitted, scans all Luau files.' },
+    },
+    additionalProperties: false,
+  }),
 ];
 
 // ── Public API ────────────────────────────────────────────────────────────────
@@ -1461,6 +1498,41 @@ export function handleTool(workspaceRoot, requestedName, args = {}) {
         return textResult(jsonText(lintLuauText(text, resolved)));
       }
       return textResult(jsonText(scanLuauLint(workspaceRoot)));
+    }
+
+    case 'luau.api_map': {
+      if (args.filePath) {
+        const resolved = resolveFilePath(workspaceRoot, args.filePath);
+        const text = readText(resolved);
+        return textResult(jsonText(extractGameApiMap(text, resolved)));
+      }
+      return textResult(jsonText(scanGameApi(workspaceRoot)));
+    }
+
+    case 'luau.feature_parity': {
+      const oldResolved = resolveFilePath(workspaceRoot, args.oldPath);
+      const newResolved = resolveFilePath(workspaceRoot, args.newPath);
+      const oldText = readText(oldResolved);
+      const newText = readText(newResolved);
+      return textResult(jsonText(analyzeFeatureParity(oldText, newText, oldResolved, newResolved)));
+    }
+
+    case 'luau.respawn_check': {
+      if (args.filePath) {
+        const resolved = resolveFilePath(workspaceRoot, args.filePath);
+        const text = readText(resolved);
+        return textResult(jsonText(checkRespawnLifecycle(text, resolved)));
+      }
+      return textResult(jsonText(scanRespawnChecks(workspaceRoot)));
+    }
+
+    case 'luau.compat': {
+      if (args.filePath) {
+        const resolved = resolveFilePath(workspaceRoot, args.filePath);
+        const text = readText(resolved);
+        return textResult(jsonText(checkExecutorCompat(text, resolved)));
+      }
+      return textResult(jsonText(scanExecutorCompat(workspaceRoot)));
     }
 
     case 'workspace.diff': {
