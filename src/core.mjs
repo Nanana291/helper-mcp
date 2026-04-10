@@ -89,6 +89,9 @@ import {
   batchFixLuauFile,
   uiAuditLuau,
   performanceBudgetLuau,
+  traceCallback,
+  buildDependencyGraph,
+  buildEventMap,
 } from './luau.mjs';
 import { buildConfigValidationMarkdown, saveConfigValidation, validateConfigFile } from './config.mjs';
 import { captureLuauMetrics } from './metrics.mjs';
@@ -245,6 +248,7 @@ function toolAnnotations(canonicalName) {
     'luau.taint', 'luau.flow', 'luau.handlers', 'luau.surface', 'luau.refactor', 'luau.modulegraph', 'luau.risk_score', 'luau.diff_context',
     'luau.explain', 'luau.respawn_simulate', 'luau.grep', 'luau.extract_remote',
     'luau.ui_audit', 'luau.performance_budget', 'brain.trends',
+    'luau.callback_trace', 'luau.dependency_graph', 'luau.event_map',
     'workspace.gate',
     'brain.compare',
   ]);
@@ -1219,6 +1223,32 @@ const toolDefinitions = [
     },
     additionalProperties: false,
   }),
+  // ── New: Callback trace ──────────────────────────────────────────────────
+  toolDefinition('luau.callback_trace', ['luau.callback_trace', 'luau_callback_trace'], 'Trace execution paths from a UI control or function to all remote calls. Reports pcall coverage, loops, character guards, and function calls in the callback body.', {
+    type: 'object',
+    properties: {
+      filePath: { type: 'string', description: 'Luau file to trace. If omitted, uses workspace context.' },
+      query: { type: 'string', description: 'Name of the toggle, button, slider, dropdown, or function to trace.' },
+    },
+    required: ['query'],
+    additionalProperties: false,
+  }),
+  // ── New: Dependency graph ────────────────────────────────────────────────
+  toolDefinition('luau.dependency_graph', ['luau.dependency_graph', 'luau_dependency_graph'], 'Build call graph + variable dependency map for a Luau script. Shows which functions call which, shared remotes, variable ownership, and impact analysis (what breaks if you modify a function).', {
+    type: 'object',
+    properties: {
+      filePath: { type: 'string', description: 'Luau file to analyze. If omitted, uses workspace context.' },
+    },
+    additionalProperties: false,
+  }),
+  // ── New: Event map ───────────────────────────────────────────────────────
+  toolDefinition('luau.event_map', ['luau.event_map', 'luau_event_map'], 'Map all event connections in a Luau script: source object, event name, callback, Connect vs Once, Disconnect tracking, and orphaned connection detection for memory leak risk.', {
+    type: 'object',
+    properties: {
+      filePath: { type: 'string', description: 'Luau file to scan. If omitted, uses workspace context.' },
+    },
+    additionalProperties: false,
+  }),
 ];
 
 // ── Public API ────────────────────────────────────────────────────────────────
@@ -1997,6 +2027,24 @@ export async function handleTool(workspaceRoot, requestedName, args = {}) {
         days: args.days,
         bucketSize: args.bucketSize,
       })));
+    }
+
+    case 'luau.callback_trace': {
+      const ctFile = args.filePath || findLuauFile(workspaceRoot);
+      const ctText = ctFile ? readText(ctFile) : '';
+      return textResult(jsonText(traceCallback(ctText, args.query, ctFile || '')));
+    }
+
+    case 'luau.dependency_graph': {
+      const dgFile = args.filePath || findLuauFile(workspaceRoot);
+      const dgText = dgFile ? readText(dgFile) : '';
+      return textResult(jsonText(buildDependencyGraph(dgText, dgFile || '')));
+    }
+
+    case 'luau.event_map': {
+      const emFile = args.filePath || findLuauFile(workspaceRoot);
+      const emText = emFile ? readText(emFile) : '';
+      return textResult(jsonText(buildEventMap(emText, emFile || '')));
     }
 
     default: throw new Error(`Unknown tool: ${requestedName}`);

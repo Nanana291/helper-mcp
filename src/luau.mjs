@@ -5753,3 +5753,693 @@ export function performanceBudgetLuau(root, options = {}) {
     recommendation,
   };
 }
+
+// ═══════════════════════════════════════════════════════════════════════
+// luau.callback_trace — Trace execution paths from a toggle/control to remotes
+// ═══════════════════════════════════════════════════════════════════════
+
+/**
+ * Given a control name (toggle, button, slider, dropdown) or function name,
+ * trace ALL execution paths from that entry point to every FireServer/InvokeServer
+ * call, remote reference, and side effect. Reports pcall wrapping, loop spawning,
+ * and character guards at each path segment.
+ */
+export function traceCallback(text, query, filePath = '') {
+  const lines = text.split('\n');
+  const totalLines = lines.length;
+
+  // ── Step 1: Find the anchor (control or function) ───────────────────────
+  // Match patterns like: Toggle("Auto Farm" ...), Button("Teleport" ...),
+  // local function autoFarm(), AutoFarm = function(), ["Auto Farm"] = ...
+  const anchorPatterns = [
+    { re: new RegExp(`(?:Toggle|Button|Slider|Dropdown)\\s*\\([^)]*${escapeRegex(query)}`, 'i'), label: 'ui-control' },
+    { re: new RegExp(`local\\s+function\\s+${escapeRegex(query)}\\s*\\(`, 'i'), label: 'local-function' },
+    { re: new RegExp(`${escapeRegex(query)}\\s*=\\s*function\\s*\\(`, 'i'), label: 'function-assign' },
+    { re: new RegExp(`\\[\\s*["']${escapeRegex(query)}["']\\s*\\]\\s*=`), label: 'table-key' },
+    { re: new RegExp(`\\b(function|local\\s+function)\\s+\\w*[${escapeRegex(query.toLowerCase())}]\\w*`, 'i'), label: 'fuzzy-function' },
+  ];
+
+  const anchors = [];
+  for (const pat of anchorPatterns) {
+    for (let i = 0; i < totalLines; i++) {
+      if (pat.re.test(lines[i])) {
+        anchors.push({ line: i + 1, label: pat.label, text: lines[i].trim() });
+      }
+    }
+  }
+
+  if (anchors.length === 0) {
+    // Try case-insensitive substring match as fallback
+    const lowerQuery = query.toLowerCase();
+    for (let i = 0; i < totalLines; i++) {
+      const lower = lines[i].toLowerCase();
+      if (lower.includes(lowerQuery) && (lower.includes('function') || lower.includes('toggle') || lower.includes('button') || lower.includes('slider') || lower.includes('dropdown'))) {
+        anchors.push({ line: i + 1, label: 'fuzzy-match', text: lines[i].trim() });
+      }
+    }
+  }
+
+  if (anchors.length === 0) {
+    return {
+      query,
+      filePath,
+      totalLines,
+      anchorsFound: 0,
+      paths: [],
+      remotes: [],
+      loops: [],
+      pcallCoverage: null,
+      recommendation: `"${query}" not found in script. Try a different name or check spelling.`,
+    };
+  }
+
+  // ── Step 2: For each anchor, trace forward to find all downstream effects ─
+  const paths = [];
+  const allRemotes = new Set();
+  const allLoops = [];
+  let pcallCount = 0;
+  let unpcallCount = 0;
+
+  for (const anchor of anchors) {
+    const path = {
+      anchor,
+      functionsCalled: [],
+      remotes: [],
+      loops: [],
+      variablesMutated: [],
+      taskSpawnLoops: [],
+      pcallWrapped: 0,
+      unpcallRemotes: 0,
+      characterGuards: 0,
+      depth: 0,
+    };
+
+    // Walk forward from anchor line to find the callback body
+    // Heuristic: find the next block (between braces or do...end or function body)
+    const bodyStart = anchor.line; // 1-based
+    const bodyEnd = findBlockEnd(lines, bodyStart - 1); // convert to 0-based
+
+    if (bodyEnd <= bodyStart) {
+      // Callback body extends to end of file or until next top-level statement
+      const scanEnd = Math.min(bodyStart + 200, totalLines);
+      scanBlock(lines, bodyStart - 1, scanEnd, path, allRemotes, allLoops);
+    } else {
+      scanBlock(lines, bodyStart - 1, bodyEnd, path, allRemotes, allLoops);
+    }
+
+    pcallCount += path.pcallWrapped;
+    unpcallCount += path.unpcallRemotes;
+    path.remotes = [...new Set(path.remotes)];
+    path.loops = [...new Set(path.loops)];
+    paths.push(path);
+  }
+
+  // ── Step 3: Build summary ───────────────────────────────────────────────
+  const remotesFound = [...allRemotes].map(r => {
+    const isPcallWrapped = paths.some(p => p.remotes.includes(r) && p.pcallWrapped > 0);
+    return { name: r, pcallWrapped: isPcallWrapped };
+  });
+
+  const pcallCoverage = {
+    totalRemotes: pcallCount + unpcallCount,
+    wrapped: pcallCount,
+    unwrapped: unpcallCount,
+    ratio: pcallCount + unpcallCount > 0 ? (pcallCount / (pcallCount + unpcallCount) * 100).toFixed(0) + '%' : 'N/A',
+  };
+
+  let recommendation;
+  if (unpcallCount > 0 && pcallCount === 0) {
+    recommendation = `ALL ${unpcallCount} remote call(s) are unprotected. Wrap in pcall or pcallRef.`;
+  } else if (unpcallCount > 0) {
+    recommendation = `${unpcallCount} remote call(s) lack pcall protection. Prioritize wrapping these.`;
+  } else if (pcallCount > 0) {
+    recommendation = `All remote calls are pcall-wrapped. Callback trace looks clean.`;
+  } else {
+    recommendation = `No remote calls found in "${query}" execution paths.`;
+  }
+
+  return {
+    query,
+    filePath,
+    totalLines,
+    anchorsFound: anchors.length,
+    anchors,
+    paths,
+    remotes: remotesFound,
+    loops: [...allLoops],
+    pcallCoverage,
+    recommendation,
+  };
+}
+
+/**
+ * Scan a line range for remotes, loops, pcall wrapping, character guards, and function calls.
+ */
+function scanBlock(lines, start, end, path, allRemotes, allLoops) {
+  const fireRe = /:(FireServer|InvokeServer)\s*\(/g;
+  const pcallRe = /\bpcall\s*\(/;
+  const pcallRefRe = /\bpcallRef\s*\(/;
+  const charGuardRe = /\bCharacter\b.*HumanoidRootPart|HumanoidRootPart.*\bCharacter\b|\bCharacter\s+and\b/;
+  const loopRe = /\b(while|for|repeat)\b/;
+  const taskSpawnRe = /\btask\.spawn\s*\(/;
+  const funcCallRe = /\b([a-zA-Z_]\w*)\s*\(/;
+
+  let inPcall = false;
+  let pcallDepth = 0;
+
+  for (let i = start; i < end && i < lines.length; i++) {
+    const line = lines[i];
+
+    // Track pcall scope
+    if (pcallRe.test(line) || pcallRefRe.test(line)) {
+      inPcall = true;
+      pcallDepth++;
+    }
+    if (inPcall) {
+      const open = (line.match(/\(/g) || []).length;
+      const close = (line.match(/\)/g) || []).length;
+      pcallDepth += open - close;
+      if (pcallDepth <= 0) {
+        inPcall = false;
+        pcallDepth = 0;
+      }
+    }
+
+    // Remote calls
+    let m;
+    while ((m = fireRe.exec(line)) !== null) {
+      // Extract remote name by looking back from the FireServer/InvokeServer
+      const prefix = line.substring(0, m.index);
+      const nameMatch = prefix.match(/(\w+)\s*:/);
+      const remoteName = nameMatch ? nameMatch[1] : 'unknown';
+      path.remotes.push(remoteName);
+      allRemotes.add(remoteName);
+      if (inPcall) {
+        path.pcallWrapped++;
+      } else {
+        path.unpcallRemotes++;
+      }
+    }
+
+    // Character guards
+    if (charGuardRe.test(line)) {
+      path.characterGuards++;
+    }
+
+    // Loops
+    if (loopRe.test(line)) {
+      const loopLabel = line.trim().substring(0, 60);
+      path.loops.push(loopLabel);
+      allLoops.add(loopLabel);
+    }
+
+    // task.spawn loops
+    if (taskSpawnRe.test(line)) {
+      const spawnLabel = line.trim().substring(0, 80);
+      path.taskSpawnLoops.push(spawnLabel);
+    }
+
+    // Function calls (exclude common builtins)
+    const builtin = /^(if|then|else|elseif|end|for|while|do|repeat|until|return|local|function|and|or|not|in|true|false|nil|break|continue|task\.wait|task\.delay|task\.defer|print|warn|error|type|typeof|tostring|tonumber|pcall|xpcall|require|game|workspace|script|Enum|Vector3|CFrame|Ray|UDim2|UDim|Color3|BrickColor|TweenInfo|Instance|math|table|string|coroutine|setmetatable|getmetatable|ipairs|pairs|next|select|unpack|loadstring|gcinfo|newproxy)\s*\(/;
+    while ((m = funcCallRe.exec(line)) !== null) {
+      const name = m[1];
+      if (!builtin.test(name + '(') && name !== line.substring(m.index).split('.')[0]) {
+        // Only add if it looks like a user function call (lowercase or CamelCase, not ALLCAPS)
+        if (/^[a-zA-Z_]\w*$/.test(name) && name.length > 1 && name.length < 40) {
+          path.functionsCalled.push({ name, line: i + 1 });
+        }
+      }
+    }
+  }
+}
+
+/**
+ * Heuristic: find the end of a block starting at the given line.
+ * Returns the 0-based line index of the block end, or -1 if not found within range.
+ */
+function findBlockEnd(lines, startLine) {
+  let depth = 0;
+  let started = false;
+  const maxScan = Math.min(startLine + 300, lines.length);
+
+  for (let i = startLine; i < maxScan; i++) {
+    const line = lines[i].replace(/--.*$/, '').trim(); // strip comments
+    if (!line) continue;
+
+    // Count block openers
+    const openers = line.match(/\b(if|for|while|repeat|do|function|then)\b/g) || [];
+    const closers = line.match(/\bend\b/g) || [];
+
+    for (const kw of openers) {
+      depth++;
+      started = true;
+    }
+    for (const _kw of closers) {
+      depth--;
+    }
+
+    if (started && depth <= 0) {
+      return i;
+    }
+  }
+  return -1;
+}
+
+// ═══════════════════════════════════════════════════════════════════════
+// luau.dependency_graph — Build call graph + variable dependency map
+// ═══════════════════════════════════════════════════════════════════════
+
+/**
+ * Build a dependency graph of a Luau script: which functions call which,
+ * which functions use which variables, which remotes are shared,
+ * and what happens if you remove or modify a function.
+ */
+export function buildDependencyGraph(text, filePath = '') {
+  const lines = text.split('\n');
+  const totalLines = lines.length;
+
+  // ── Step 1: Extract all named functions ─────────────────────────────────
+  const functions = {};
+  const funcDefRe = /(?:local\s+)?function\s+([\w:]+)\s*\(/g;
+  const funcAssignRe = /(\w+)\s*=\s*function\s*\(/g;
+
+  for (let i = 0; i < totalLines; i++) {
+    const line = lines[i];
+    let m;
+    while ((m = funcDefRe.exec(line)) !== null) {
+      functions[m[1]] = { line: i + 1, calls: [], uses: [], remotes: [], loops: 0, complexity: 0, callers: [] };
+    }
+    funcAssignRe.lastIndex = 0;
+    while ((m = funcAssignRe.exec(line)) !== null) {
+      functions[m[1]] = { line: i + 1, calls: [], uses: [], remotes: [], loops: 0, complexity: 0, callers: [] };
+    }
+  }
+
+  // ── Step 2: For each function, find its body and analyze ────────────────
+  const funcNames = Object.keys(functions);
+  const callRe = /(\w+)\s*\(/g;
+  const remoteRe = /(\w+)\s*:(FireServer|InvokeServer)\s*\(/;
+  const loopRe = /\b(while|for)\b/g;
+  const builtinSet = new Set(['if','then','else','elseif','end','for','while','do','repeat','until','return','local','function','and','or','not','in','true','false','nil','break','continue','print','warn','error','type','typeof','tostring','tonumber','pcall','xpcall','require','game','workspace','script','Enum','Vector3','CFrame','Ray','UDim2','UDim','Color3','BrickColor','TweenInfo','Instance','math','table','string','coroutine','setmetatable','getmetatable','ipairs','pairs','next','select','unpack','loadstring','gcinfo','newproxy','task','tick','wait']);
+
+  for (const name of funcNames) {
+    const fn = functions[name];
+    const bodyStart = fn.line; // 1-based
+    const bodyEnd = findBlockEnd(lines, bodyStart - 1);
+    const scanEnd = bodyEnd > 0 ? bodyEnd : Math.min(bodyStart + 200, totalLines);
+
+    for (let i = bodyStart - 1; i < scanEnd && i < totalLines; i++) {
+      const line = lines[i].replace(/--.*$/, '');
+
+      // Function calls
+      callRe.lastIndex = 0;
+      let m;
+      while ((m = callRe.exec(line)) !== null) {
+        const called = m[1];
+        if (funcNames.includes(called) && called !== name && !builtinSet.has(called)) {
+          if (!fn.calls.includes(called)) {
+            fn.calls.push(called);
+          }
+        }
+      }
+
+      // Remote usage
+      if ((m = line.match(remoteRe)) !== null) {
+        const remoteName = m[1];
+        if (!fn.remotes.includes(remoteName)) {
+          fn.remotes.push(remoteName);
+        }
+      }
+
+      // Loop count
+      loopRe.lastIndex = 0;
+      while (loopRe.exec(line) !== null) {
+        fn.loops++;
+      }
+
+      // Complexity (rough: each branch/loop adds 1)
+      const branchRe = /\b(if|elseif|else|for|while|and|or)\b/g;
+      while (branchRe.exec(line) !== null) {
+        fn.complexity++;
+      }
+    }
+  }
+
+  // ── Step 3: Build reverse call graph (callers) ──────────────────────────
+  for (const name of funcNames) {
+    for (const called of functions[name].calls) {
+      if (functions[called]) {
+        if (!functions[called].callers.includes(name)) {
+          functions[called].callers.push(name);
+        }
+      }
+    }
+  }
+
+  // ── Step 4: Variable dependency analysis ────────────────────────────────
+  const variables = {};
+  const localVarRe = /local\s+(\w+)\s*=/g;
+  const tableVarRe = /local\s+(\w+)\s*=\s*\{/g;
+  const varUseRe = /\b(\w+)\b/g;
+
+  for (const name of funcNames) {
+    const fn = functions[name];
+    const bodyStart = fn.line;
+    const bodyEnd = findBlockEnd(lines, bodyStart - 1);
+    const scanEnd = bodyEnd > 0 ? bodyEnd : Math.min(bodyStart + 200, totalLines);
+
+    for (let i = bodyStart - 1; i < scanEnd && i < totalLines; i++) {
+      const line = lines[i].replace(/--.*$/, '');
+
+      // Local var definitions
+      let m;
+      while ((m = localVarRe.exec(line)) !== null) {
+        const varName = m[1];
+        if (!builtinSet.has(varName)) {
+          variables[varName] = variables[varName] || { definedAt: i + 1, usedBy: [], writtenBy: [] };
+          if (!variables[varName].usedBy.includes(name)) {
+            variables[varName].usedBy.push(name);
+          }
+          if (!variables[varName].writtenBy.includes(name)) {
+            variables[varName].writtenBy.push(name);
+          }
+        }
+      }
+
+      // Variable usage (skip the function's own name and builtins)
+      varUseRe.lastIndex = 0;
+      while ((m = varUseRe.exec(line)) !== null) {
+        const varName = m[1];
+        if (variables[varName] && !builtinSet.has(varName) && varName !== name) {
+          if (!variables[varName].usedBy.includes(name)) {
+            variables[varName].usedBy.push(name);
+          }
+        }
+      }
+    }
+  }
+
+  // ── Step 5: Shared remote analysis ──────────────────────────────────────
+  const remoteSharing = {};
+  for (const name of funcNames) {
+    for (const remote of functions[name].remotes) {
+      if (!remoteSharing[remote]) remoteSharing[remote] = [];
+      remoteSharing[remote].push(name);
+    }
+  }
+
+  // ── Step 6: Impact analysis — what breaks if you modify a function ──────
+  const impactAnalysis = {};
+  for (const name of funcNames) {
+    const fn = functions[name];
+    const transitiveCallers = new Set(fn.callers);
+
+    // BFS up the caller tree
+    const queue = [...fn.callers];
+    while (queue.length > 0) {
+      const current = queue.shift();
+      for (const caller of (functions[current]?.callers || [])) {
+        if (!transitiveCallers.has(caller)) {
+          transitiveCallers.add(caller);
+          queue.push(caller);
+        }
+      }
+    }
+
+    impactAnalysis[name] = {
+      directCallers: fn.callers,
+      transitiveCallers: [...transitiveCallers],
+      sharedRemotes: fn.remotes.filter(r => (remoteSharing[r] || []).length > 1),
+      riskLevel: transitiveCallers.size > 3 ? 'high' : transitiveCallers.size > 1 ? 'medium' : 'low',
+    };
+  }
+
+  // ── Build report ────────────────────────────────────────────────────────
+  const functionList = funcNames.map(name => ({
+    name,
+    line: functions[name].line,
+    calls: functions[name].calls,
+    callers: functions[name].callers,
+    remotes: functions[name].remotes,
+    loops: functions[name].loops,
+    complexity: functions[name].complexity,
+  }));
+
+  const variableList = Object.keys(variables).map(name => ({
+    name,
+    definedAt: variables[name].definedAt,
+    usedBy: variables[name].usedBy,
+    writtenBy: variables[name].writtenBy,
+    sharedAcross: variables[name].usedBy.length > 1 ? variables[name].usedBy : null,
+  }));
+
+  const sharedRemoteList = Object.keys(remoteSharing).map(remote => ({
+    remote,
+    functions: remoteSharing[remote],
+  }));
+
+  const highRiskFunctions = funcNames.filter(n => impactAnalysis[n].riskLevel === 'high');
+
+  return {
+    filePath,
+    totalLines,
+    totalFunctions: funcNames.length,
+    totalVariables: Object.keys(variables).length,
+    functions: functionList,
+    variables: variableList,
+    sharedRemotes: sharedRemoteList,
+    impactAnalysis,
+    highRiskFunctions,
+    summary: {
+      mostCalledFunction: funcNames.reduce((best, n) =>
+        (!best || functions[n].callers.length > functions[best].callers.length) ? n : best, null),
+      mostCallingFunction: funcNames.reduce((best, n) =>
+        (!best || functions[n].calls.length > functions[best].calls.length) ? n : best, null),
+      mostSharedRemote: Object.keys(remoteSharing).reduce((best, r) =>
+        (!best || remoteSharing[r].length > remoteSharing[best].length) ? r : best, null),
+      highRiskCount: highRiskFunctions.length,
+    },
+  };
+}
+
+// ═══════════════════════════════════════════════════════════════════════
+// luau.event_map — Map all event connections with lifecycle analysis
+// ═══════════════════════════════════════════════════════════════════════
+
+/**
+ * Extract ALL event connections in a Luau script: which object, which event,
+ * which callback, whether it uses :Connect() or :Once(), whether it gets
+ * disconnected, and identify orphaned connections (memory leak risk).
+ */
+export function buildEventMap(text, filePath = '') {
+  const lines = text.split('\n');
+  const totalLines = lines.length;
+
+  // ── Step 1: Find all :Connect() and :Once() calls ──────────────────────
+  const connectRe = /(\w+)\s*:\s*(Connect|Once)\s*\(\s*([\w.]+)/g;
+  const connectInlineRe = /(\w+)\s*:\s*(Connect|Once)\s*\(\s*function\s*\(/g;
+  const disconnectRe = /(\w+)\s*:\s*Disconnect\s*\(\s*\)/g;
+  const taskSpawnConnectRe = /task\.spawn\s*\(\s*(\w+)/g;
+
+  const connections = [];
+  const disconnects = [];
+  const connectionVariables = {}; // tracks which var holds the connection
+
+  for (let i = 0; i < totalLines; i++) {
+    const line = lines[i];
+
+    // Named callback connections: Player.CharacterAdded:Connect(onCharacterAdded)
+    let m;
+    while ((m = connectRe.exec(line)) !== null) {
+      const [, source, method, callback] = m;
+      connections.push({
+        line: i + 1,
+        source,
+        event: callback.includes('.') ? callback.split('.')[1] : 'Unknown',
+        sourceObject: source,
+        callback,
+        method,
+        isNamed: true,
+        isInline: false,
+      });
+    }
+
+    // Inline function connections: Player.CharacterAdded:Connect(function()
+    connectInlineRe.lastIndex = 0;
+    while ((m = connectInlineRe.exec(line)) !== null) {
+      const [, source, method] = m;
+      connections.push({
+        line: i + 1,
+        source,
+        event: 'Unknown',
+        sourceObject: source,
+        callback: '(inline function)',
+        method,
+        isNamed: false,
+        isInline: true,
+      });
+    }
+
+    // Disconnections: connection:Disconnect()
+    disconnectRe.lastIndex = 0;
+    while ((m = disconnectRe.exec(line)) !== null) {
+      disconnects.push({ line: i + 1, name: m[1] });
+    }
+
+    // task.spawn wrapping: task.spawn(someFunction)
+    taskSpawnConnectRe.lastIndex = 0;
+    while ((m = taskSpawnConnectRe.exec(line)) !== null) {
+      // This is a taskSpawn call, not a disconnect — skip for now
+    }
+  }
+
+  // ── Step 2: Track connection variables ──────────────────────────────────
+  // Look for patterns like: local conn = Something:Connect(...)
+  const connAssignRe = /local\s+(\w+)\s*=\s*(\w+)\s*:\s*(Connect|Once)\s*\(/g;
+  const connAssignRe2 = /(\w+)\s*=\s*(\w+)\s*:\s*(Connect|Once)\s*\(/g;
+
+  for (let i = 0; i < totalLines; i++) {
+    const line = lines[i];
+    let m;
+    connAssignRe.lastIndex = 0;
+    while ((m = connAssignRe.exec(line)) !== null) {
+      const [, varName, source, method] = m;
+      connectionVariables[varName] = { assignedAt: i + 1, source, method };
+    }
+    // Also catch non-local assignments
+    connAssignRe2.lastIndex = 0;
+    while ((m = connAssignRe2.exec(line)) !== null) {
+      const [, varName, source, method] = m;
+      if (!connectionVariables[varName]) {
+        connectionVariables[varName] = { assignedAt: i + 1, source, method };
+      }
+    }
+  }
+
+  // ── Step 3: Classify events by type ─────────────────────────────────────
+  const eventTypes = {
+    character: ['CharacterAdded', 'CharacterRemoving', 'CharacterAppearanceLoaded'],
+    input: ['InputBegan', 'InputEnded', 'InputChanged', 'MouseButton1Click', 'MouseButton1Down'],
+    remote: ['OnServerEvent', 'OnClientEvent', 'OnServerInvoke', 'OnClientInvoke'],
+    loop: ['Heartbeat', 'RenderStepped', 'Stepped'],
+    property: ['GetPropertyChangedSignal', 'Changed'],
+    workspace: ['ChildAdded', 'ChildRemoved', 'DescendantAdded', 'DescendantRemoving'],
+    player: ['PlayerAdded', 'PlayerRemoving', 'OnPlayerEvent'],
+  };
+
+  for (const conn of connections) {
+    conn.classifiedAs = 'unknown';
+    for (const [category, events] of Object.entries(eventTypes)) {
+      if (events.some(e => conn.event.includes(e) || conn.callback.includes(e))) {
+        conn.classifiedAs = category;
+        break;
+      }
+    }
+    // Also check source object name for hints
+    if (conn.classifiedAs === 'unknown') {
+      const src = conn.sourceObject.toLowerCase();
+      if (src.includes('player')) conn.classifiedAs = 'player';
+      else if (src.includes('character')) conn.classifiedAs = 'character';
+      else if (src.includes('remote') || src.includes('event') || src.includes('function')) conn.classifiedAs = 'remote';
+      else if (src.includes('heartbeat') || src.includes('render') || src.includes('stepped')) conn.classifiedAs = 'loop';
+      else if (src.includes('button') || src.includes('input') || src.includes('mouse')) conn.classifiedAs = 'input';
+      else if (src.includes('changed') || src.includes('property')) conn.classifiedAs = 'property';
+    }
+  }
+
+  // ── Step 4: Detect orphaned connections (no Disconnect) ────────────────
+  const disconnectNames = new Set(disconnects.map(d => d.name));
+  const orphanedConnections = [];
+
+  // Check assigned variables that are never disconnected
+  for (const [varName, info] of Object.entries(connectionVariables)) {
+    if (!disconnectNames.has(varName)) {
+      orphanedConnections.push({
+        variable: varName,
+        assignedAt: info.assignedAt,
+        source: info.source,
+        method: info.method,
+        risk: 'high',
+      });
+    }
+  }
+
+  // Also flag named callbacks that appear to be connection targets but have no cleanup
+  const callbackNames = connections.filter(c => c.isNamed).map(c => c.callback);
+  const callbackCleanupRe = new RegExp(`(${callbackNames.map(escapeRegex).join('|')})\\s*:\\s*Disconnect`, 'g');
+
+  for (const conn of connections.filter(c => c.isNamed)) {
+    const fullText = text;
+    const hasDisconnect = fullText.includes(`${conn.callback}:Disconnect`) ||
+                          fullText.includes(`${conn.callback} :Disconnect`) ||
+                          disconnects.some(d => d.name === conn.callback);
+    if (!hasDisconnect && conn.classifiedAs !== 'character') {
+      // Character callbacks are expected to persist, but loop/input/property should clean up
+      if (['loop', 'input', 'property', 'remote'].includes(conn.classifiedAs)) {
+        orphanedConnections.push({
+          callback: conn.callback,
+          connectedAt: conn.line,
+          source: conn.sourceObject,
+          event: conn.event,
+          classifiedAs: conn.classifiedAs,
+          risk: conn.classifiedAs === 'loop' ? 'high' : 'medium',
+        });
+      }
+    }
+  }
+
+  // ── Step 5: Build summary ──────────────────────────────────────────────
+  const byCategory = {};
+  for (const conn of connections) {
+    const cat = conn.classifiedAs;
+    if (!byCategory[cat]) byCategory[cat] = [];
+    byCategory[cat].push({
+      line: conn.line,
+      source: conn.sourceObject,
+      event: conn.event,
+      callback: conn.callback,
+      method: conn.method,
+    });
+  }
+
+  const orphanedByRisk = { high: 0, medium: 0, low: 0 };
+  for (const o of orphanedConnections) {
+    orphanedByRisk[o.risk] = (orphanedByRisk[o.risk] || 0) + 1;
+  }
+
+  let recommendation;
+  if (orphanedConnections.length === 0) {
+    recommendation = `All ${connections.length} connection(s) have proper cleanup. No orphaned connections detected.`;
+  } else {
+    const highRisk = orphanedConnections.filter(o => o.risk === 'high');
+    const mediumRisk = orphanedConnections.filter(o => o.risk === 'medium');
+    recommendation = `${orphanedConnections.length} connection(s) lack Disconnect cleanup: ${highRisk.length} high-risk (loop/remote), ${mediumRisk.length} medium-risk. Memory leak risk.`;
+  }
+
+  return {
+    filePath,
+    totalLines,
+    totalConnections: connections.length,
+    totalDisconnections: disconnects.length,
+    totalOrphaned: orphanedConnections.length,
+    connections: connections.map(c => ({
+      line: c.line,
+      source: c.sourceObject,
+      event: c.event,
+      callback: c.callback,
+      method: c.method,
+      isNamed: c.isNamed,
+      isInline: c.isInline,
+      classifiedAs: c.classifiedAs,
+    })),
+    disconnections: disconnects,
+    orphanedConnections,
+    byCategory,
+    orphanedByRisk,
+    recommendation,
+  };
+}
+
+function escapeRegex(str) {
+  return str.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+}
