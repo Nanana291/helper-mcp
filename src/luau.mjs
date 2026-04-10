@@ -6440,6 +6440,1390 @@ export function buildEventMap(text, filePath = '') {
   };
 }
 
+// ═══════════════════════════════════════════════════════════════════════
+// luau.remote_payload_analyzer — Extract FireServer/InvokeServer payload schemas
+// ═══════════════════════════════════════════════════════════════════════
+
+/**
+ * For every FireServer/InvokeServer call in a script, extracts:
+ * - Remote name
+ * - Method (FireServer / InvokeServer)
+ * - Ordered argument list with inferred types
+ * - Table payload schemas (when first arg is a table literal)
+ * - Call-site frequency (how many times this remote is called)
+ *
+ * Output: per-remote "API" tables like:
+ *   FarmRemote: FireServer(action: string, target?: any, distance?: number)
+ */
+export function analyzeRemotePayloads(text, filePath = '') {
+  const lines = text.split(/\r?\n/);
+  const totalLines = lines.length;
+  const callSites = [];
+
+  // Step 1: Find every FireServer / InvokeServer call and capture full argument string
+  for (let i = 0; i < totalLines; i++) {
+    const line = lines[i];
+    const callRe = /(\w[\w.]*)\s*:\s*(FireServer|InvokeServer)\s*\(/;
+    const match = callRe.exec(line);
+    if (!match) continue;
+
+    const remoteName = match[1];
+    const method = match[2];
+    const argStart = match.index + match[0].length;
+
+    // Collect the full argument string across lines
+    const { argString, endLine } = collectBalanced(text, lines, i, argStart);
+    const args = parseArguments(argString);
+    const argSchema = args.map((a, idx) => inferArgSchema(a, idx));
+
+    callSites.push({
+      line: i + 1,
+      remoteName,
+      method,
+      argumentCount: args.length,
+      arguments: argSchema,
+      rawSnippet: argString.slice(0, 200),
+    });
+  }
+
+  // Step 2: Group by remote name and merge schemas
+  const byRemote = {};
+  for (const cs of callSites) {
+    if (!byRemote[cs.remoteName]) {
+      byRemote[cs.remoteName] = {
+        remoteName: cs.remoteName,
+        methods: new Set(),
+        callCount: 0,
+        callSites: [],
+        argumentSignatures: [],
+      };
+    }
+    const entry = byRemote[cs.remoteName];
+    entry.methods.add(cs.method);
+    entry.callCount++;
+    entry.callSites.push({ line: cs.line, method: cs.method, arguments: cs.arguments });
+
+    // Merge argument signature if it looks distinct
+    const sigKey = cs.arguments.map(a => a.inferredType || 'any').join(',');
+    if (!entry.argumentSignatures.find(s => s.signatureKey === sigKey)) {
+      entry.argumentSignatures.push({
+        signatureKey: sigKey,
+        arguments: cs.arguments,
+        usedAtLines: [cs.line],
+      });
+    } else {
+      const existing = entry.argumentSignatures.find(s => s.signatureKey === sigKey);
+      existing.usedAtLines.push(cs.line);
+    }
+  }
+
+  // Step 3: Build human-readable API strings
+  const remoteApis = [];
+  for (const [name, entry] of Object.entries(byRemote)) {
+    const methods = [...entry.methods].join('/');
+    for (const sig of entry.argumentSignatures) {
+      const argStr = sig.arguments.map(a => {
+        const opt = a.optional ? '?' : '';
+        return `${a.name || `arg${a.index + 1}`}${opt}: ${a.inferredType}`;
+      }).join(', ');
+      remoteApis.push(`${name}: ${methods}(${argStr})`);
+    }
+  }
+
+  // Convert sets to arrays for JSON serialization
+  const serializableByRemote = {};
+  for (const [name, entry] of Object.entries(byRemote)) {
+    serializableByRemote[name] = {
+      remoteName: entry.remoteName,
+      methods: [...entry.methods],
+      callCount: entry.callCount,
+      callSites: entry.callSites,
+      argumentSignatures: entry.argumentSignatures,
+    };
+  }
+
+  return {
+    filePath: toPosix(filePath),
+    totalCalls: callSites.length,
+    uniqueRemotes: Object.keys(byRemote).length,
+    remoteApis,
+    byRemote: serializableByRemote,
+  };
+}
+
+/**
+ * Collect a balanced argument string starting from a position in a line,
+ * tracking parenthesis depth across multiple lines.
+ */
+function collectBalanced(fullText, lines, startLineIndex, startPos) {
+  let depth = 1; // we start after the opening (
+  let result = '';
+  let endLine = startLineIndex;
+
+  for (let li = startLineIndex; li < lines.length; li++) {
+    const lineText = li === startLineIndex ? lines[li].substring(startPos) : lines[li];
+    endLine = li;
+    for (const ch of lineText) {
+      if (depth <= 0) break;
+      if (ch === '(') depth++;
+      else if (ch === ')') {
+        depth--;
+        if (depth === 0) break;
+      }
+      result += ch;
+    }
+    if (depth <= 0) break;
+    result += '\n';
+  }
+
+  return { argString: result.replace(/\)\s*$/, '').trim(), endLine: endLine + 1 };
+}
+
+/**
+ * Parse a raw argument string into individual argument tokens.
+ * Reuses the existing splitTopLevelArgs from extractRemotePayloads module.
+ */
+function parseArguments(argString) {
+  if (!argString || !argString.trim()) return [];
+  return splitTopLevelArgs(argString);
+}
+
+/**
+ * Infer the schema of a single argument.
+ */
+function inferArgSchema(rawArg, index) {
+  const trimmed = rawArg.trim();
+  const result = {
+    index,
+    raw: trimmed.slice(0, 120),
+    inferredType: 'any',
+    name: null,
+    optional: false,
+  };
+
+  // String literal
+  if (/^["']/.test(trimmed)) {
+    result.inferredType = 'string';
+    result.name = null;
+    result.literalValue = trimmed.replace(/^["']|["']$/g, '').slice(0, 60);
+    return result;
+  }
+
+  // Number literal
+  if (/^-?\d+\.?\d*$/.test(trimmed)) {
+    result.inferredType = 'number';
+    return result;
+  }
+
+  // Boolean
+  if (trimmed === 'true' || trimmed === 'false') {
+    result.inferredType = 'boolean';
+    return result;
+  }
+
+  // nil
+  if (trimmed === 'nil') {
+    result.inferredType = 'nil';
+    result.optional = true;
+    return result;
+  }
+
+  // Enum
+  if (trimmed.startsWith('Enum.')) {
+    result.inferredType = 'enum';
+    result.name = trimmed;
+    return result;
+  }
+
+  // Table literal
+  if (trimmed.startsWith('{')) {
+    result.inferredType = 'table';
+    result.tableKeys = extractTableKeys(trimmed);
+    result.tableSchema = inferTableSchema(trimmed);
+    return result;
+  }
+
+  // Variable reference — infer type from naming convention
+  if (/^[A-Z]\w*$/.test(trimmed)) {
+    // Uppercase-start often = service or class
+    if (trimmed.endsWith('Service') || trimmed === 'Players' || trimmed === 'Workspace' || trimmed === 'ReplicatedStorage') {
+      result.inferredType = 'service';
+    } else if (trimmed === 'Character' || trimmed === 'HumanoidRootPart' || trimmed === 'Humanoid') {
+      result.inferredType = 'instance';
+    } else {
+      result.inferredType = 'any';
+    }
+    result.name = camelToSnake(trimmed);
+  } else if (/^[a-z]\w*$/.test(trimmed)) {
+    // Lowercase — likely a local variable
+    if (trimmed.includes('pos') || trimmed.includes('cf') || trimmed.includes('vector')) {
+      result.inferredType = 'Vector3';
+    } else if (trimmed.includes('str') || trimmed.includes('name') || trimmed.includes('mode')) {
+      result.inferredType = 'string';
+    } else if (trimmed.includes('num') || trimmed.includes('dist') || trimmed.includes('speed') || trimmed.includes('dmg')) {
+      result.inferredType = 'number';
+    } else if (trimmed.includes('tbl') || trimmed.includes('data') || trimmed.includes('cfg')) {
+      result.inferredType = 'table';
+    } else {
+      result.inferredType = 'any';
+    }
+    result.name = trimmed;
+  } else {
+    // Complex expression
+    result.inferredType = 'any';
+    result.name = null;
+  }
+
+  return result;
+}
+
+/**
+ * Infer a simple table schema from a table literal: key → inferred type.
+ */
+function inferTableSchema(tableText) {
+  const schema = {};
+  // Match key = value patterns
+  const kvRe = /(\w+)\s*=\s*([^,}\n]+)/g;
+  let m;
+  while ((m = kvRe.exec(tableText)) !== null) {
+    const key = m[1];
+    const val = m[2].trim();
+    let type = 'any';
+    if (/^["']/.test(val)) type = 'string';
+    else if (/^-?\d+\.?\d*$/.test(val)) type = 'number';
+    else if (val === 'true' || val === 'false') type = 'boolean';
+    else if (val.startsWith('{')) type = 'table';
+    else if (/^[A-Z]/.test(val)) type = 'any';
+    schema[key] = type;
+  }
+  return schema;
+}
+
+function camelToSnake(str) {
+  return str.replace(/([a-z])([A-Z])/g, '$1_$2').toLowerCase();
+}
+
+// ═══════════════════════════════════════════════════════════════════════
+// luau.anti_pattern_detector — Scan for the 10 most common script-breaking errors
+// ═══════════════════════════════════════════════════════════════════════
+
+/**
+ * Scans a Luau script for the 10 most common error patterns that break scripts:
+ *
+ * 1.  GetService without cache in loops
+ * 2.  FindFirstChild repeated without variable
+ * 3.  while true without task.wait
+ * 4.  Callbacks that mutate the same toggle that activates them (re-entry)
+ * 5.  Character used without nil validation
+ * 6.  task.spawn without loop or without validate Character
+ * 7.  Implicit global variables (without local)
+ * 8.  Inline closures in hot paths
+ * 9.  Multiple :Connect() to the same event without prior disconnect
+ * 10. Uncached requires
+ */
+export function detectAntiPatterns(text, filePath = '') {
+  const lines = text.split(/\r?\n/);
+  const totalLines = lines.length;
+  const findings = [];
+
+  // Cache for tracking state across the file
+  const getServiceCalls = new Map();  // serviceName → [{line, cached}]
+  const findFirstChildCalls = [];       // {line, pattern, withinLoop}
+  const whileTrueLoops = [];            // {line, hasWait}
+  const toggleCallbacks = new Map();    // toggleFlag → {line, mutates}
+  const characterUsages = [];           // {line, guarded}
+  const taskSpawns = [];                // {line, hasLoop, hasCharGuard}
+  const implicitGlobals = [];           // {line, name}
+  const inlineClosures = [];            // {line, inHotPath}
+  const connectCalls = new Map();       // eventRef → [{line}]
+  const uncachedRequires = [];          // {line, module}
+
+  // Pre-scan: identify which service results are cached at top of file
+  const cachedServices = new Set();
+  for (let i = 0; i < Math.min(50, totalLines); i++) {
+    const m = lines[i].match(/local\s+(\w+)\s*=\s*\w+:\s*GetService\s*\(\s*["']([^"']+)["']\s*\)/);
+    if (m) cachedServices.add(m[2]);
+  }
+
+  // Pre-scan: identify function boundaries
+  const funcRanges = extractFunctionRanges(lines);
+
+  // Pre-scan: find all toggle/callback patterns
+  const toggleDefRe = /(?:AddToggle|Toggles?|Callback)\s*[\[\(][^)]*["']([^"']+)["']/g;
+  const allToggleFlags = new Set();
+  for (let i = 0; i < totalLines; i++) {
+    let tm;
+    toggleDefRe.lastIndex = 0;
+    while ((tm = toggleDefRe.exec(lines[i])) !== null) {
+      allToggleFlags.add(tm[1]);
+    }
+  }
+
+  // ── Main scan ─────────────────────────────────────────────────────────
+  for (let i = 0; i < totalLines; i++) {
+    const line = lines[i];
+    const trimmed = line.trim();
+    if (trimmed.startsWith('--')) continue;
+
+    // ── Pattern 1: GetService without cache in loops ──
+    const gsMatch = trimmed.match(/(\w+)\s*:\s*GetService\s*\(\s*["']([^"']+)["']\s*\)/);
+    if (gsMatch) {
+      const caller = gsMatch[1];
+      const svcName = gsMatch[2];
+      if (caller !== 'game' || !cachedServices.has(svcName)) {
+        // Check if this is inside a loop
+        const inLoop = isInsideLoop(lines, i, funcRanges);
+        if (inLoop) {
+          findings.push({
+            pattern: 'getservice-in-loop',
+            severity: 'high',
+            line: i + 1,
+            message: `GetService("${svcName}") called inside a loop at line ${i + 1}. Cache the service at the top of the file.`,
+            suggestion: `local ${svcName} = game:GetService("${svcName}") — cache at top, use the local inside loops.`,
+          });
+        }
+      }
+    }
+
+    // ── Pattern 2: FindFirstChild repeated without variable ──
+    const ffcRe = /(\w+)\s*:\s*FindFirstChild\s*\(\s*["']([^"']+)["']\s*\)/g;
+    let ffcM;
+    while ((ffcM = ffcRe.exec(line)) !== null) {
+      const target = ffcM[2];
+      findFirstChildCalls.push({ line: i + 1, pattern: `${ffcM[1]}:FindFirstChild("${target}")`, withinLoop: isInsideLoop(lines, i, funcRanges) });
+    }
+
+    // ── Pattern 3: while true without task.wait ──
+    if (/^\s*while\s+true\s+do/.test(line)) {
+      let hasWait = false;
+      let depth = 1;
+      for (let j = i + 1; j < Math.min(i + 50, totalLines); j++) {
+        const inner = lines[j].trim();
+        if (/task\.wait\s*\(/.test(inner) || /\btask\.wait\b/.test(inner)) { hasWait = true; }
+        depth += (inner.match(/\b(while|for|repeat|if|then|do)\b/g) || []).length;
+        depth -= (inner.match(/\bend\b/g) || []).length;
+        if (depth <= 0) break;
+      }
+      whileTrueLoops.push({ line: i + 1, hasWait });
+      if (!hasWait) {
+        findings.push({
+          pattern: 'unbounded-while-true',
+          severity: 'critical',
+          line: i + 1,
+          message: `while true do at line ${i + 1} has no task.wait() — will freeze the executor.`,
+          suggestion: 'Add task.wait() at the end of the loop body.',
+        });
+      }
+    }
+
+    // ── Pattern 4: Callbacks that mutate the same toggle (re-entry) ──
+    for (const flag of allToggleFlags) {
+      const flagRe = new RegExp(`Toggles?\\s*[\\[.]\\s*["']?${escapeRegex(flag)}["']?\\s*[\\].].*Value\\s*=`, 'g');
+      if (flagRe.test(trimmed)) {
+        // Check if this is inside the toggle's own callback
+        const func = findEnclosingFunction(lines, i, funcRanges);
+        if (func && func.bodyText && func.bodyText.toLowerCase().includes(flag.toLowerCase())) {
+          findings.push({
+            pattern: 'toggle-reentry',
+            severity: 'high',
+            line: i + 1,
+            message: `Toggle "${flag}" mutates its own value inside its callback — causes re-entry / infinite loop.`,
+            suggestion: 'Use a guard variable or defer the state change outside the callback.',
+          });
+        }
+      }
+    }
+
+    // ── Pattern 5: Character used without nil validation ──
+    if (/\bCharacter\b/.test(trimmed) && !/\bCharacter\s+and\b/.test(trimmed) && !/\bif\s+.*Character/.test(trimmed)) {
+      // Check if Character is validated nearby (within 10 lines above)
+      let hasGuard = false;
+      for (let j = Math.max(0, i - 10); j < i; j++) {
+        if (/HumanoidRootPart/.test(lines[j]) && /Character/.test(lines[j])) { hasGuard = true; break; }
+        if (/if\s+.*Character/.test(lines[j])) { hasGuard = true; break; }
+      }
+      if (!hasGuard && /\bCharacter\b/.test(trimmed) && !/local\s+Character/.test(trimmed) && !/CharacterAdded/.test(trimmed)) {
+        characterUsages.push({ line: i + 1, guarded: false });
+      }
+    }
+
+    // ── Pattern 6: task.spawn without loop or without validate Character ──
+    if (/\btask\.spawn\s*\(/.test(trimmed)) {
+      const hasLoop = /while|for|repeat/.test(trimmed) || hasLoopNearby(lines, i);
+      const hasCharGuard = /HumanoidRootPart/.test(line) || /Character\s+and/.test(line);
+      taskSpawns.push({ line: i + 1, hasLoop, hasCharGuard });
+      if (!hasLoop && !hasCharGuard) {
+        findings.push({
+          pattern: 'taskspawn-no-guard',
+          severity: 'medium',
+          line: i + 1,
+          message: `task.spawn at line ${i + 1} has no character guard (HumanoidRootPart check) and no loop — may fire on nil character.`,
+          suggestion: 'Add: if not Character or not Character:FindFirstChild("HumanoidRootPart") then return end',
+        });
+      }
+    }
+
+    // ── Pattern 7: Implicit global variables ──
+    // Heuristic: assignment to an identifier that was never declared with local
+    // We look for: Identifier = ... (without local, not inside a table, not a function def)
+    const globalAssignRe = /^\s*([A-Z]\w*)\s*=\s*(?!\s*function)/;
+    const gaMatch = globalAssignRe.exec(line);
+    if (gaMatch && !/local\s+/.test(trimmed) && !/^\s*--/.test(trimmed)) {
+      const varName = gaMatch[1];
+      // Check if it was declared local somewhere before
+      const wasDeclared = lines.slice(0, i).some(l => new RegExp(`local\\s+${escapeRegex(varName)}\\b`).test(l));
+      if (!wasDeclared && varName.length > 1 && varName.length < 40) {
+        // Exclude common services and known globals
+        const knownGlobals = new Set(['game', 'workspace', 'script', 'Players', 'Toggles', 'Options', 'Library', 'Window', 'Plr', 'Character', 'Humanoid', 'HumanoidRootPart', 'RunService', 'TweenService', 'ReplicatedStorage', 'HttpService', 'UserInputService', 'Teams', 'Stats', 'Lighting', 'StarterGui', 'StarterPack', 'SoundService', 'CollectionService', 'Debris', 'ContextActionService', 'GuiService', 'MarketplaceService', 'TeleportService', 'Chat', 'TextService']);
+        if (!knownGlobals.has(varName)) {
+          findings.push({
+            pattern: 'implicit-global',
+            severity: 'high',
+            line: i + 1,
+            message: `${varName} assigned without local declaration at line ${i + 1} — becomes a global. Adds register pressure and risks cross-scope pollution.`,
+            suggestion: `Add "local ${varName}" at the top of the scope.`,
+          });
+        }
+      }
+    }
+
+    // ── Pattern 8: Inline closures in hot paths ──
+    // Detect anonymous functions inside Connect(), in loops, or in frequently-called contexts
+    const inlineFuncRe = /:\s*(?:Connect|Callback)\s*\(\s*function\s*\(/;
+    if (inlineFuncRe.test(trimmed) && isInsideLoop(lines, i, funcRanges)) {
+      inlineClosures.push({ line: i + 1, inHotPath: true });
+      findings.push({
+        pattern: 'inline-closure-in-loop',
+        severity: 'medium',
+        line: i + 1,
+        message: `Inline anonymous function in a loop at line ${i + 1} — creates a new closure every iteration.`,
+        suggestion: 'Extract the callback to a named function declared outside the loop.',
+      });
+    }
+
+    // ── Pattern 9: Multiple :Connect() to same event without disconnect ──
+    const connectRe = /(\w[\w.]*)\s*:\s*(?:Connect|Once)\s*\(/;
+    const cMatch = connectRe.exec(line);
+    if (cMatch) {
+      const eventRef = cMatch[1];
+      if (!connectCalls.has(eventRef)) connectCalls.set(eventRef, []);
+      connectCalls.get(eventRef).push({ line: i + 1 });
+    }
+  }
+
+  // Post-scan: Find repeated FindFirstChild calls on the same target
+  const ffcByTarget = {};
+  for (const ffc of findFirstChildCalls) {
+    if (!ffcByTarget[ffc.pattern]) ffcByTarget[ffc.pattern] = [];
+    ffcByTarget[ffc.pattern].push(ffc.line);
+  }
+  for (const [pattern, lineList] of Object.entries(ffcByTarget)) {
+    if (lineList.length >= 3) {
+      findings.push({
+        pattern: 'repeated-ffc',
+        severity: 'medium',
+        lines: lineList,
+        line: lineList[0],
+        message: `${pattern} called ${lineList.length} times across lines ${lineList.join(', ')}. Cache the result in a local variable.`,
+        suggestion: `local cached = parent:FindFirstChild("...") — reuse instead of calling ${lineList.length} times.`,
+      });
+    }
+  }
+
+  // Post-scan: unguarded Character usages
+  const unguardedChars = characterUsages.filter(c => !c.guarded);
+  if (unguardedChars.length > 5) {
+    findings.push({
+      pattern: 'character-no-guard',
+      severity: 'high',
+      line: unguardedChars[0].line,
+      affectedLines: unguardedChars.map(c => c.line).slice(0, 10),
+      totalUnguarded: unguardedChars.length,
+      message: `${unguardedChars.length} usages of Character without nil validation. If Character is nil (respawning), these will error.`,
+      suggestion: 'Add: if not Character or not Character:FindFirstChild("HumanoidRootPart") then return end at the start of loops/callbacks.',
+    });
+  }
+
+  // Post-scan: Multiple connects without disconnect
+  for (const [eventRef, calls] of connectCalls.entries()) {
+    if (calls.length > 1) {
+      // Check if there's a Disconnect for this event
+      const hasDisconnect = text.includes(`${eventRef}:Disconnect`) || text.includes(`${eventRef} :Disconnect`);
+      if (!hasDisconnect) {
+        findings.push({
+          pattern: 'multiple-connect-no-disconnect',
+          severity: 'high',
+          lines: calls.map(c => c.line),
+          line: calls[0].line,
+          message: `${eventRef} has ${calls.length} :Connect() calls at lines ${calls.map(c => c.line).join(', ')} without :Disconnect() — connection leak.`,
+          suggestion: 'Store the connection in a variable and call :Disconnect() before re-connecting or on cleanup.',
+        });
+      }
+    }
+  }
+
+  // Post-scan: uncached requires
+  const requireRe = /(?:local\s+\w+\s*=\s*)?require\s*\(\s*([^)]+)\)/g;
+  const reqCalls = [];
+  let rm;
+  for (let i = 0; i < totalLines; i++) {
+    requireRe.lastIndex = 0;
+    while ((rm = requireRe.exec(lines[i])) !== null) {
+      reqCalls.push({ line: i + 1, module: rm[1].trim() });
+    }
+  }
+  // require() called repeatedly inside loops or functions = uncached
+  for (const req of reqCalls) {
+    if (isInsideLoop(lines, req.line - 1, funcRanges)) {
+      findings.push({
+        pattern: 'uncached-require-in-loop',
+        severity: 'high',
+        line: req.line,
+        message: `require(${req.module}) called inside a loop at line ${req.line}. Module loading is expensive — cache at the top.`,
+        suggestion: `local mod = require(${req.module}) — declare at the top of the file or function.`,
+      });
+    }
+  }
+
+  // ── Summary ──
+  const bySeverity = { critical: 0, high: 0, medium: 0, low: 0, info: 0 };
+  for (const f of findings) {
+    bySeverity[f.severity] = (bySeverity[f.severity] || 0) + 1;
+  }
+
+  const byPattern = {};
+  for (const f of findings) {
+    if (!byPattern[f.pattern]) byPattern[f.pattern] = [];
+    byPattern[f.pattern].push(f);
+  }
+
+  let antiPatternScore;
+  const totalWeight = findings.reduce((sum, f) => {
+    const weights = { critical: 10, high: 7, medium: 4, low: 2, info: 1 };
+    return sum + (weights[f.severity] || 1);
+  }, 0);
+  if (totalWeight === 0) antiPatternScore = 100;
+  else if (totalWeight < 10) antiPatternScore = 85;
+  else if (totalWeight < 25) antiPatternScore = 70;
+  else if (totalWeight < 50) antiPatternScore = 50;
+  else antiPatternScore = Math.max(10, 100 - totalWeight);
+
+  return {
+    filePath: toPosix(filePath),
+    totalLines,
+    antiPatternScore,
+    totalFindings: findings.length,
+    bySeverity,
+    byPattern: Object.fromEntries(
+      Object.entries(byPattern).map(([k, v]) => [k, { count: v.length, items: v.map(f => ({ line: f.line, severity: f.severity, message: f.message })) }])
+    ),
+    findings: findings.map(f => ({
+      pattern: f.pattern,
+      severity: f.severity,
+      line: f.line,
+      lines: f.lines,
+      affectedLines: f.affectedLines,
+      message: f.message,
+      suggestion: f.suggestion,
+    })),
+  };
+}
+
+/**
+ * Check if a line index is inside a loop construct.
+ */
+function isInsideLoop(lines, lineIndex, funcRanges) {
+  // Walk backwards from the line to find an enclosing loop
+  let depth = 0;
+  for (let i = lineIndex; i >= Math.max(0, lineIndex - 100); i--) {
+    const line = lines[i].trim();
+    // Count loop openers
+    const openers = (line.match(/\b(while|for|repeat)\b/g) || []).length;
+    const closers = (line.match(/\bend\b/g) || []).length;
+    depth += openers;
+    depth -= closers;
+    if (depth > 0) return true;
+  }
+  return false;
+}
+
+/**
+ * Check if there's a loop near a task.spawn call.
+ */
+function hasLoopNearby(lines, lineIndex) {
+  const range = 5;
+  for (let i = Math.max(0, lineIndex - range); i <= Math.min(lines.length - 1, lineIndex + range); i++) {
+    if (/\bwhile\s|\bfor\s|\brepeat\b/.test(lines[i])) return true;
+  }
+  return false;
+}
+
+/**
+ * Find the enclosing function for a given line.
+ */
+function findEnclosingFunction(lines, lineIndex, funcRanges) {
+  for (const func of funcRanges) {
+    if (lineIndex >= func.start - 1 && lineIndex <= func.end - 1) {
+      return {
+        name: func.name,
+        start: func.start,
+        end: func.end,
+        bodyText: lines.slice(func.start - 1, func.end).join('\n'),
+      };
+    }
+  }
+  return null;
+}
+
+// ═══════════════════════════════════════════════════════════════════════
+// luau.state_table_extractor — Find and schema all state tables
+// ═══════════════════════════════════════════════════════════════════════
+
+/**
+ * Finds ALL state tables in a script: Settings, Flags, Config, RuntimeInfo,
+ * Toggles, Options, etc. Returns the schema: what keys they have, default values,
+ * inferred types, and which functions read/write them.
+ */
+export function extractStateTables(text, filePath = '') {
+  const lines = text.split(/\r?\n/);
+  const totalLines = lines.length;
+
+  // Step 1: Identify all table declarations
+  const tableDecls = [];
+
+  // Pattern 1: local Name = { ... } (multi-line)
+  // Pattern 2: Name = { ... } (global)
+  // Pattern 3: local Name = {} followed by Name.key = value assignments
+
+  for (let i = 0; i < totalLines; i++) {
+    const line = lines[i];
+    const trimmed = line.trim();
+    if (trimmed.startsWith('--')) continue;
+
+    // Match: local TableName = {  OR  TableName = {
+    const tableStartRe = /(?:local\s+)?(\w[\w.]*)\s*=\s*\{/;
+    const tsMatch = tableStartRe.exec(trimmed);
+    if (tsMatch) {
+      const tableName = tsMatch[1];
+      // Skip obvious non-state tables (function calls, short-lived locals)
+      if (isLikelyStateTable(tableName, trimmed, lines, i)) {
+        const { keys, endLine } = extractTableBody(lines, i);
+        tableDecls.push({
+          name: tableName,
+          line: i + 1,
+          endLine: endLine + 1,
+          keys,
+          declarationLine: trimmed.slice(0, 100),
+          isLocal: /local\s+/.test(trimmed),
+        });
+        i = endLine; // skip to end of table
+      }
+    }
+  }
+
+  // Step 2: Find all reads and writes to each table
+  for (const td of tableDecls) {
+    const readers = [];
+    const writers = [];
+    const baseName = td.name.split('.')[0]; // handle Table.SubTable
+    const accessRe = new RegExp(`\\b${escapeRegex(td.name)}\\b`, 'g');
+    const writeRe = new RegExp(`\\b${escapeRegex(td.name)}\\s*\\.\\s*(\\w+)\\s*=`, 'g');
+    const readRe = new RegExp(`\\b${escapeRegex(td.name)}\\s*\\.\\s*(\\w+)\\b`, 'g');
+
+    for (let i = 0; i < totalLines; i++) {
+      const line = lines[i];
+      if (i >= td.line - 1 && i <= td.endLine - 1) continue; // skip declaration lines
+
+      // Write detection
+      writeRe.lastIndex = 0;
+      let wm;
+      while ((wm = writeRe.exec(line)) !== null) {
+        writers.push({ line: i + 1, key: wm[1], context: line.trim().slice(0, 100) });
+      }
+
+      // Read detection (any access that's not a write)
+      readRe.lastIndex = 0;
+      let rm;
+      while ((rm = readRe.exec(line)) !== null) {
+        const key = rm[1];
+        const isWrite = writeRe.test(line);
+        writeRe.lastIndex = 0; // reset
+        if (!isWrite) {
+          readers.push({ line: i + 1, key, context: line.trim().slice(0, 100) });
+        }
+      }
+    }
+
+    td.readers = readers;
+    td.writers = writers;
+    td.readCount = readers.length;
+    td.writeCount = writers.length;
+
+    // Determine which functions read/write
+    const funcRanges = extractFunctionRanges(lines);
+    td.functionsRead = [];
+    td.functionsWritten = [];
+    for (const func of funcRanges) {
+      const funcText = lines.slice(func.start - 1, func.end).join('\n');
+      if (accessRe.test(funcText)) {
+        const funcWriteRe = new RegExp(`\\b${escapeRegex(td.name)}\\s*\\.\\s*\\w+\\s*=`);
+        if (funcWriteRe.test(funcText)) {
+          td.functionsWritten.push({ name: func.name, line: func.start });
+        } else {
+          td.functionsRead.push({ name: func.name, line: func.start });
+        }
+      }
+    }
+  }
+
+  // Step 3: Enrich with inferred types for table keys
+  for (const td of tableDecls) {
+    for (const key of td.keys) {
+      key.inferredType = inferTypeFromValue(key.rawValue);
+    }
+  }
+
+  // Step 4: Identify table roles
+  for (const td of tableDecls) {
+    td.role = classifyTableRole(td.name, td.keys);
+  }
+
+  return {
+    filePath: toPosix(filePath),
+    totalLines,
+    tableCount: tableDecls.length,
+    tables: tableDecls.map(td => ({
+      name: td.name,
+      line: td.line,
+      endLine: td.endLine,
+      isLocal: td.isLocal,
+      keyCount: td.keys.length,
+      role: td.role,
+      keys: td.keys,
+      readCount: td.readCount,
+      writeCount: td.writeCount,
+      readers: td.readers.slice(0, 20),
+      writers: td.writers.slice(0, 20),
+      functionsRead: td.functionsRead,
+      functionsWritten: td.functionsWritten,
+    })),
+  };
+}
+
+/**
+ * Determine if a table declaration looks like a state table (vs. a temporary one).
+ */
+function isLikelyStateTable(name, firstLine, allLines, lineIndex) {
+  // Skip tables that are function return values or very short
+  const stateNamePatterns = /^(Settings|Flags|Config|RuntimeInfo|Toggles|Options|State|Data|Cache|Storage|Variables|Vars|DB|Database|Metadata|Profile|UserInfo|PlayerData|Inventory|Stats|Attributes|Perks|Abilities|Items|Weapons|Loadout|CurrentConfig|SavedSettings|ThemeConfig|KeyBinds|AutoLoad)$/i;
+
+  // Name-based heuristic
+  if (stateNamePatterns.test(name)) return true;
+
+  // Size heuristic: if the table body spans 3+ lines, it's likely state
+  let braceDepth = 0;
+  let started = false;
+  let lineCount = 0;
+  for (let i = lineIndex; i < Math.min(lineIndex + 200, allLines.length); i++) {
+    const line = allLines[i];
+    for (const ch of line) {
+      if (ch === '{') { braceDepth++; started = true; }
+      else if (ch === '}') { braceDepth--; }
+    }
+    lineCount++;
+    if (started && braceDepth <= 0) break;
+  }
+  return lineCount >= 3;
+}
+
+/**
+ * Extract keys and their default values from a multi-line table body.
+ */
+function extractTableBody(lines, startLine) {
+  const keys = [];
+  let braceDepth = 0;
+  let started = false;
+  let endLine = startLine;
+
+  for (let i = startLine; i < Math.min(startLine + 200, lines.length); i++) {
+    endLine = i;
+    const line = lines[i];
+    for (let ci = 0; ci < line.length; ci++) {
+      const ch = line[ci];
+      if (ch === '{') { braceDepth++; started = true; }
+      else if (ch === '}') {
+        braceDepth--;
+        if (started && braceDepth <= 0) break;
+      }
+    }
+
+    // Extract key = value pairs from this line
+    if (started && braceDepth > 0) {
+      const kvRe = /(\w+)\s*=\s*([^,}\n]+)/g;
+      let m;
+      while ((m = kvRe.exec(line)) !== null) {
+        keys.push({
+          name: m[1],
+          rawValue: m[2].trim().slice(0, 100),
+          line: i + 1,
+          inferredType: 'any',
+        });
+      }
+    }
+
+    if (started && braceDepth <= 0) break;
+  }
+
+  return { keys, endLine };
+}
+
+/**
+ * Infer a Luau type from a raw value string.
+ */
+function inferTypeFromValue(rawValue) {
+  const v = rawValue.trim();
+  if (!v) return 'any';
+  if (/^["']/.test(v)) return 'string';
+  if (/^-?\d+\.?\d*$/.test(v)) return 'number';
+  if (v === 'true' || v === 'false') return 'boolean';
+  if (v === 'nil') return 'nil';
+  if (v === '{}') return 'table';
+  if (v.startsWith('{')) return 'table';
+  if (v.startsWith('Vector3')) return 'Vector3';
+  if (v.startsWith('CFrame')) return 'CFrame';
+  if (v.startsWith('UDim2')) return 'UDim2';
+  if (v.startsWith('Color3')) return 'Color3';
+  if (v.startsWith('Enum.')) return 'enum';
+  if (/^[A-Z]/.test(v)) return 'any'; // could be instance or constant
+  return 'any';
+}
+
+/**
+ * Classify the role of a state table based on its name and keys.
+ */
+function classifyTableRole(name, keys) {
+  const lowerName = name.toLowerCase();
+
+  if (lowerName.includes('toggle') || keys.some(k => k.rawValue === 'true' || k.rawValue === 'false')) {
+    return 'toggles';
+  }
+  if (lowerName.includes('option') || lowerName.includes('config') || lowerName.includes('setting')) {
+    return 'configuration';
+  }
+  if (lowerName.includes('flag')) {
+    return 'feature-flags';
+  }
+  if (lowerName.includes('runtime') || lowerName.includes('state') || lowerName.includes('cache')) {
+    return 'runtime-state';
+  }
+  if (lowerName.includes('player') || lowerName.includes('data') || lowerName.includes('profile') || lowerName.includes('save')) {
+    return 'player-data';
+  }
+  if (lowerName.includes('ui') || lowerName.includes('theme') || lowerName.includes('style')) {
+    return 'ui-config';
+  }
+
+  return 'general-state';
+}
+
+// ═══════════════════════════════════════════════════════════════════════
+// luau.ui_scaffold — Generate LibSixtyTen/Obsidian UI code from JSON spec
+// ═══════════════════════════════════════════════════════════════════════
+
+/**
+ * Given a JSON spec of tabs → sections → controls, generates complete
+ * LibSixtyTen UI code with status paragraphs, Toggle/Slider/Dropdown/Button,
+ * and callback wiring ready to fill in.
+ *
+ * Input spec format:
+ * {
+ *   gameName: "MyGame",
+ *   tabs: {
+ *     "Main": {
+ *       "General": [
+ *         { type: "toggle", name: "Auto Farm", flag: "AutoFarm", default: false },
+ *         { type: "dropdown", name: "Farm Mode", flag: "FarmMode", items: ["Nearest", "Farthest"], default: "Nearest" }
+ *       ],
+ *       "Status": [
+ *         { type: "paragraph", name: "Auto Farm Status", text: "<initial HTML>" }
+ *       ]
+ *     },
+ *     "Combat": {
+ *       "Attack": [
+ *         { type: "toggle", name: "Auto Attack", flag: "AutoAttack", default: false },
+ *         { type: "slider", name: "Attack Range", flag: "AttackRange", min: 1, max: 100, default: 50 }
+ *       ]
+ *     }
+ *   }
+ * }
+ */
+export function generateUiScaffold(spec) {
+  const gameName = spec.gameName || 'UnknownGame';
+  const tabs = spec.tabs || spec;
+
+  // If spec is just a raw tabs object without gameName, handle it
+  if (!spec.gameName && spec.tabs === undefined) {
+    // The input is the tabs object directly
+  }
+
+  const lines = [];
+
+  lines.push(`--[[`);
+  lines.push(`    Imp Hub X — ${gameName}`);
+  lines.push(`    Auto-generated UI scaffold from JSON spec`);
+  lines.push(`    Tabs: ${Object.keys(tabs).length}, Sections: ${countSections(tabs)}, Controls: ${countControls(tabs)}`);
+  lines.push(`]]`);
+  lines.push('');
+
+  // ── Section 1: Cached Services ──
+  lines.push('-- ============================================================');
+  lines.push('-- 1. CACHED SERVICES');
+  lines.push('-- ============================================================');
+  lines.push('local Players = game:GetService("Players")');
+  lines.push('local RunService = game:GetService("RunService")');
+  lines.push('local ReplicatedStorage = game:GetService("ReplicatedStorage")');
+  lines.push('local Workspace = game:GetService("Workspace")');
+  lines.push('');
+
+  // ── Section 2: Local Caching ──
+  lines.push('-- ============================================================');
+  lines.push('-- 2. LOCAL VARIABLE CACHING');
+  lines.push('-- ============================================================');
+  lines.push('local t_insert, m_huge, str_fmt = table.insert, math.huge, string.format');
+  lines.push('local pcallRef, taskWait, taskSpawn = pcall, task.wait, task.spawn');
+  lines.push('');
+
+  // ── Section 3: LibSixtyTen Load ──
+  lines.push('-- ============================================================');
+  lines.push('-- 3. LIBSIXTYTEN LOAD');
+  lines.push('-- ============================================================');
+  lines.push('local function LoadLibSixtyTen()');
+  lines.push('    local urls = {');
+  lines.push('        "https://raw.githubusercontent.com/Nanana291/Kong/refs/heads/main/LibSixtyTen.lua",');
+  lines.push('    }');
+  lines.push('    for _, url in ipairs(urls) do');
+  lines.push('        local ok, result = pcallRef(function()');
+  lines.push('            local source = game:HttpGet(url)');
+  lines.push('            if source and #source > 0 then');
+  lines.push('                local chunk = loadstring(source)');
+  lines.push('                return chunk and chunk() or nil');
+  lines.push('            end');
+  lines.push('            return nil');
+  lines.push('        end)');
+  lines.push('        if ok and result and type(result) == "table" then return result end');
+  lines.push('    end');
+  lines.push(`    warn("${gameName}: LibSixtyTen load failed")`);
+  lines.push('    return nil');
+  lines.push('end');
+  lines.push('');
+  lines.push('local Library = LoadLibSixtyTen()');
+  lines.push('if not Library then return end');
+  lines.push('');
+
+  // ── Section 4: Toggle/Option Stores ──
+  lines.push('-- ============================================================');
+  lines.push('-- 4. TOGGLE AND OPTION STORES');
+  lines.push('-- ============================================================');
+  lines.push('local Toggles = {}');
+  lines.push('local Options = {}');
+  lines.push('');
+
+  // ── Section 5: Status Helpers ──
+  lines.push('-- ============================================================');
+  lines.push('-- 5. STATUS HELPERS');
+  lines.push('-- ============================================================');
+  lines.push('local STATUS_COLORS = {');
+  lines.push('    DISABLED = "#ef4444", ACTIVE = "#22c55e", WAITING = "#f59e0b",');
+  lines.push('    SCANNING = "#06b6d4", TARGETING = "#3b82f6", MOVING = "#0ea5e9",');
+  lines.push('    FIGHTING = "#f97316", DONE = "#84cc16", ERROR = "#dc2626",');
+  lines.push('}');
+  lines.push('');
+  lines.push('local function BuildBasicStatus(state, subtext)');
+  lines.push('    local s = STATUS_COLORS[state] and state or "DISABLED"');
+  lines.push('    return str_fmt(');
+  lines.push('        "<font size=\'14\' color=\'%s\'><b>● %s</b></font>\\n<font size=\'12\' color=\'%s\'>%s</font>",');
+  lines.push('        STATUS_COLORS[s], s, "#9ca3af", subtext or "Ready..."');
+  lines.push('    )');
+  lines.push('end');
+  lines.push('');
+  lines.push('local function BuildDetailedStatus(state, headline, meta)');
+  lines.push('    local s = STATUS_COLORS[state] and state or "DISABLED"');
+  lines.push('    local m = meta and str_fmt("\\n<font size=\'11\' color=\'%s\'>%s</font>", "#6b7280", meta) or ""');
+  lines.push('    return str_fmt(');
+  lines.push('        "<font size=\'14\' color=\'%s\'><b>● %s</b></font>\\n<font size=\'13\' color=\'%s\'>%s</font>%s",');
+  lines.push('        STATUS_COLORS[s], s, "#f3f4f6", headline or "Ready...", m');
+  lines.push('    )');
+  lines.push('end');
+  lines.push('');
+  lines.push('local function BuildMacroStatus(status, headline, detail, progress)');
+  lines.push('    local s = STATUS_COLORS[status] and status or "DISABLED"');
+  lines.push('    local pct = progress and str_fmt(" [%d%%]", progress) or ""');
+  lines.push('    local d = detail and str_fmt("\\n<font size=\'11\' color=\'%s\'>%s</font>", "#6b7280", detail) or ""');
+  lines.push('    return str_fmt(');
+  lines.push('        "<font size=\'14\' color=\'%s\'><b>● %s%s</b></font>\\n<font size=\'13\' color=\'%s\'>%s</font>%s",');
+  lines.push('        STATUS_COLORS[s], s, pct, "#f3f4f6", headline or "Ready...", d');
+  lines.push('    )');
+  lines.push('end');
+  lines.push('');
+
+  // ── Section 6: Section Adapter ──
+  lines.push('-- ============================================================');
+  lines.push('-- 6. SECTION ADAPTER');
+  lines.push('-- ============================================================');
+  lines.push('local function CreateSectionAdapter(section)');
+  lines.push('    local adapter = { Section = section }');
+  lines.push('    function adapter:AddToggle(flag, config)');
+  lines.push('        Toggles[flag] = { Element = nil, Value = config.Default or false }');
+  lines.push('        local toggle = section:Toggle({');
+  lines.push('            Name = config.Text or flag, Flag = flag, Default = config.Default or false,');
+  lines.push('            ToolTip = config.Tooltip or "",');
+  lines.push('            Callback = function(value)');
+  lines.push('                if Toggles[flag] then Toggles[flag].Value = value end');
+  lines.push('                if config.Callback then config.Callback(value) end');
+  lines.push('            end,');
+  lines.push('        })');
+  lines.push('        Toggles[flag].Element = toggle');
+  lines.push('        return Toggles[flag]');
+  lines.push('    end');
+  lines.push('    function adapter:AddSlider(flag, config)');
+  lines.push('        Options[flag] = { Element = nil, Value = config.Default }');
+  lines.push('        local slider = section:Slider({');
+  lines.push('            Name = config.Text or flag, Flag = flag, Default = config.Default,');
+  lines.push('            Min = config.Min, Max = config.Max,');
+  lines.push('            Callback = function(value)');
+  lines.push('                if Options[flag] then Options[flag].Value = value end');
+  lines.push('                if config.Callback then config.Callback(value) end');
+  lines.push('            end,');
+  lines.push('        })');
+  lines.push('        Options[flag].Element = slider');
+  lines.push('        return Options[flag]');
+  lines.push('    end');
+  lines.push('    function adapter:AddDropdown(flag, config)');
+  lines.push('        Options[flag] = { Element = nil, Value = config.Default }');
+  lines.push('        local dd = section:Dropdown({');
+  lines.push('            Name = config.Text or flag, Flag = flag,');
+  lines.push('            Items = config.Values or {}, Multi = config.Multi or false,');
+  lines.push('            Callback = function(value)');
+  lines.push('                if Options[flag] then Options[flag].Value = value end');
+  lines.push('                if config.Callback then config.Callback(value) end');
+  lines.push('            end,');
+  lines.push('        })');
+  lines.push('        Options[flag].Element = dd');
+  lines.push('        return Options[flag]');
+  lines.push('    end');
+  lines.push('    function adapter:AddButton(config)');
+  lines.push('        return section:Button({');
+  lines.push('            Name = config.Text, ToolTip = config.Tooltip or "",');
+  lines.push('            Callback = config.Func or function() end,');
+  lines.push('        })');
+  lines.push('    end');
+  lines.push('    function adapter:AddParagraph(name, text)');
+  lines.push('        return section:Paragraph({ Name = name, Text = text or BuildBasicStatus("DISABLED", "No status set") })');
+  lines.push('    end');
+  lines.push('    return adapter');
+  lines.push('end');
+  lines.push('');
+
+  // ── Section 7: Window + Dashboard ──
+  lines.push('-- ============================================================');
+  lines.push('-- 7. WINDOW + DASHBOARD');
+  lines.push('-- ============================================================');
+  lines.push('local Window = Library:Window({');
+  lines.push('    Name = "Imp Hub X",');
+  lines.push(`    SubName = "${gameName}",`);
+  lines.push('    Logo = "79000737943964",');
+  lines.push('    SelectedTab = 1,');
+  lines.push('    Compact = false,');
+  lines.push('})');
+  lines.push('');
+  lines.push('Library:CreateDashboard(Window)');
+  lines.push('');
+
+  // ── Section 8: Pages (Tabs) ──
+  const tabNames = Object.keys(tabs);
+  const tabIcons = getDefaultTabIcons(tabNames);
+
+  lines.push('-- ============================================================');
+  lines.push('-- 8. PAGES + TABS');
+  lines.push('-- ============================================================');
+  lines.push('local Pages = {');
+  for (let t = 0; t < tabNames.length; t++) {
+    const tabName = tabNames[t];
+    const icon = tabIcons[tabName] || 'circle';
+    const comma = t < tabNames.length - 1 ? ',' : '';
+    lines.push(`    ${tabName.replace(/\s+/g, '')} = Window:Page({ Name = "${tabName}", Icon = "${icon}", Columns = 2 })${comma}`);
+  }
+  lines.push('}');
+  lines.push('');
+
+  lines.push('local Tabs = {');
+  for (const tabName of tabNames) {
+    const key = tabName.replace(/\s+/g, '');
+    lines.push(`    ${key} = CreateSectionAdapter(Pages.${key}),`);
+  }
+  lines.push('}');
+  lines.push('');
+
+  // ── Section 9: UI Controls (generated from spec) ──
+  lines.push('-- ============================================================');
+  lines.push('-- 9. UI CONTROLS (auto-generated from spec)');
+  lines.push('-- ============================================================');
+
+  for (const [tabName, sections] of Object.entries(tabs)) {
+    const tabKey = tabName.replace(/\s+/g, '');
+    lines.push('');
+    lines.push(`-- ── Tab: ${tabName} ──`);
+
+    if (typeof sections === 'object' && !Array.isArray(sections)) {
+      // sections is an object: sectionName → controls[]
+      for (const [sectionName, controls] of Object.entries(sections)) {
+        lines.push(``);
+        lines.push(`local ${tabKey}_${sectionName.replace(/\s+/g, '')} = Tabs.${tabKey}.Section:Section({ Name = "${sectionName}" })`);
+        lines.push(`local ${tabKey}${sectionName.replace(/\s+/g, '')}Adapter = CreateSectionAdapter(${tabKey}_${sectionName.replace(/\s+/g, '')})`);
+
+        for (const control of controls) {
+          lines.push(generateControlCode(tabKey, sectionName, control));
+        }
+      }
+    } else if (Array.isArray(sections)) {
+      // sections is a flat array of controls
+      lines.push('');
+      for (const control of sections) {
+        lines.push(generateControlCode(tabKey, 'Main', control));
+      }
+    }
+  }
+
+  lines.push('');
+
+  // ── Section 10: Character Lifecycle ──
+  lines.push('-- ============================================================');
+  lines.push('-- 10. CHARACTER LIFECYCLE');
+  lines.push('-- ============================================================');
+  lines.push('local Plr = Players.LocalPlayer');
+  lines.push('local Character = Plr.Character or Plr.CharacterAdded:Wait()');
+  lines.push('Plr.CharacterAdded:Connect(function(c)');
+  lines.push('    Character = c');
+  lines.push('    -- TODO: Re-bind any character-dependent logic here');
+  lines.push('end)');
+  lines.push('');
+
+  // ── Section 11: TODO markers ──
+  lines.push('-- ============================================================');
+  lines.push('-- 11. TODO: FILL IN CALLBACKS');
+  lines.push('-- ============================================================');
+  const allFlags = collectAllFlags(tabs);
+  for (const flag of allFlags) {
+    lines.push(`-- TODO: Implement callback for "${flag}" — check Toggles["${flag}"].Value in your loop`);
+  }
+
+  const code = lines.join('\n') + '\n';
+
+  return {
+    gameName,
+    tabCount: tabNames.length,
+    sectionCount: countSections(tabs),
+    controlCount: countControls(tabs),
+    flags: allFlags,
+    code,
+    codeLines: lines.length,
+  };
+}
+
+/**
+ * Generate the Luau code line(s) for a single control spec.
+ */
+function generateControlCode(tabKey, sectionName, control) {
+  const adapterVar = `${tabKey}${sectionName.replace(/\s+/g, '')}Adapter`;
+  const flag = control.flag || control.Flag || control.name?.replace(/\s+/g, '') || 'UnknownFlag';
+  const name = control.name || flag;
+
+  switch (control.type) {
+    case 'toggle': {
+      const defaultVal = control.default !== undefined ? control.default : false;
+      const tooltip = control.tooltip || control.tooltip || '';
+      return [
+        `${adapterVar}:AddToggle("${flag}", {`,
+        `    Text = "${name}",`,
+        `    Default = ${defaultVal},`,
+        `    Tooltip = "${tooltip}",`,
+        `    Callback = function(value)`,
+        `        -- TODO: Handle ${name} enabled/disabled`,
+        `        -- Example: if value then startLoop() else stopLoop() end`,
+        `    end,`,
+        `})`,
+      ].join('\n');
+    }
+
+    case 'slider': {
+      const defaultVal = control.default !== undefined ? control.default : 50;
+      const min = control.min !== undefined ? control.min : 0;
+      const max = control.max !== undefined ? control.max : 100;
+      return [
+        `${adapterVar}:AddSlider("${flag}", {`,
+        `    Text = "${name}",`,
+        `    Default = ${defaultVal},`,
+        `    Min = ${min},`,
+        `    Max = ${max},`,
+        `    Callback = function(value)`,
+        `        -- TODO: Handle ${name} = ${"value"}`,
+        `    end,`,
+        `})`,
+      ].join('\n');
+    }
+
+    case 'dropdown': {
+      const items = control.items || control.values || [];
+      const defaultVal = control.default || (items[0] || '');
+      return [
+        `${adapterVar}:AddDropdown("${flag}", {`,
+        `    Text = "${name}",`,
+        `    Values = {${items.map(i => `"${i}"`).join(', ')}},`,
+        `    Default = "${defaultVal}",`,
+        `    Multi = ${control.multi || false},`,
+        `    Callback = function(value)`,
+        `        -- TODO: Handle ${name} selection change`,
+        `    end,`,
+        `})`,
+      ].join('\n');
+    }
+
+    case 'button': {
+      const tooltip = control.tooltip || '';
+      return [
+        `${adapterVar}:AddButton({`,
+        `    Text = "${name}",`,
+        `    Tooltip = "${tooltip}",`,
+        `    Func = function()`,
+        `        -- TODO: Implement ${name} action`,
+        `    end,`,
+        `})`,
+      ].join('\n');
+    }
+
+    case 'paragraph': {
+      const text = control.text || `BuildBasicStatus("DISABLED", "${name} — no status")`;
+      return `${adapterVar}:AddParagraph("${name}", ${text})`;
+    }
+
+    case 'color': {
+      return [
+        `${adapterVar}:AddColorPicker("${flag}", {`,
+        `    Text = "${name}",`,
+        `    Default = ${control.default || 'Color3.fromRGB(255, 255, 255)'},`,
+        `    Callback = function(value)`,
+        `        -- TODO: Handle ${name} color change`,
+        `    end,`,
+        `})`,
+      ].join('\n');
+    }
+
+    case 'keybind': {
+      return [
+        `${adapterVar}:AddKeyPicker("${flag}", {`,
+        `    Text = "${name}",`,
+        `    Default = ${control.default || '"F"'},`,
+        `    Mode = "Toggle",`,
+        `    Callback = function(value)`,
+        `        -- TODO: Handle ${name} keybind`,
+        `    end,`,
+        `})`,
+      ].join('\n');
+    }
+
+    default:
+      return `-- TODO: Unknown control type "${control.type}" for "${name}"`;
+  }
+}
+
+/**
+ * Get default icons for common tab names.
+ */
+function getDefaultTabIcons(tabNames) {
+  const iconMap = {
+    Main: 'home',
+    Combat: 'swords',
+    Farming: 'crosshair',
+    Players: 'user',
+    Teleports: 'map-pin',
+    Misc: 'more-horizontal',
+    Settings: 'settings',
+    Config: 'settings',
+    Visuals: 'eye',
+    ESP: 'eye',
+    Character: 'user',
+    Movement: 'move',
+    Weapons: 'sword',
+    Shop: 'shopping-cart',
+    Teleport: 'map-pin',
+    World: 'globe',
+  };
+  const result = {};
+  for (const name of tabNames) {
+    for (const [key, icon] of Object.entries(iconMap)) {
+      if (name.toLowerCase() === key.toLowerCase()) {
+        result[name] = icon;
+        break;
+      }
+    }
+  }
+  return result;
+}
+
+/**
+ * Count total sections in a tabs object.
+ */
+function countSections(tabs) {
+  let count = 0;
+  for (const sections of Object.values(tabs)) {
+    if (typeof sections === 'object' && !Array.isArray(sections)) {
+      count += Object.keys(sections).length;
+    } else {
+      count += 1;
+    }
+  }
+  return count;
+}
+
+/**
+ * Count total controls in a tabs object.
+ */
+function countControls(tabs) {
+  let count = 0;
+  for (const sections of Object.values(tabs)) {
+    if (typeof sections === 'object' && !Array.isArray(sections)) {
+      for (const controls of Object.values(sections)) {
+        if (Array.isArray(controls)) count += controls.length;
+      }
+    } else if (Array.isArray(sections)) {
+      count += sections.length;
+    }
+  }
+  return count;
+}
+
+/**
+ * Collect all flag names from the tabs spec.
+ */
+function collectAllFlags(tabs) {
+  const flags = [];
+  for (const sections of Object.values(tabs)) {
+    const controlsArray = [];
+    if (typeof sections === 'object' && !Array.isArray(sections)) {
+      for (const controls of Object.values(sections)) {
+        if (Array.isArray(controls)) controlsArray.push(...controls);
+      }
+    } else if (Array.isArray(sections)) {
+      controlsArray.push(...sections);
+    }
+    for (const c of controlsArray) {
+      if (c.flag) flags.push(c.flag);
+      else if (c.name) flags.push(c.name.replace(/\s+/g, ''));
+    }
+  }
+  return flags;
+}
+
 function escapeRegex(str) {
   return str.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
 }

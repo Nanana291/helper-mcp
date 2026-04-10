@@ -92,6 +92,10 @@ import {
   traceCallback,
   buildDependencyGraph,
   buildEventMap,
+  analyzeRemotePayloads,
+  detectAntiPatterns,
+  extractStateTables,
+  generateUiScaffold,
 } from './luau.mjs';
 import { buildConfigValidationMarkdown, saveConfigValidation, validateConfigFile } from './config.mjs';
 import { captureLuauMetrics } from './metrics.mjs';
@@ -249,6 +253,7 @@ function toolAnnotations(canonicalName) {
     'luau.explain', 'luau.respawn_simulate', 'luau.grep', 'luau.extract_remote',
     'luau.ui_audit', 'luau.performance_budget', 'brain.trends',
     'luau.callback_trace', 'luau.dependency_graph', 'luau.event_map',
+    'luau.remote_payload_analyzer', 'luau.anti_pattern_detector', 'luau.state_table_extractor',
     'workspace.gate',
     'brain.compare',
   ]);
@@ -1249,6 +1254,39 @@ const toolDefinitions = [
     },
     additionalProperties: false,
   }),
+  // ── New: Remote payload analyzer ─────────────────────────────────────────
+  toolDefinition('luau.remote_payload_analyzer', ['luau.remote_payload_analyzer', 'luau_remote_payload_analyzer'], 'Extract the API of each FireServer/InvokeServer call: argument order, inferred types, table schemas. Groups by remote name with call-site frequency.', {
+    type: 'object',
+    properties: {
+      filePath: { type: 'string', description: 'Luau file to analyze. If omitted, scans all Luau files.' },
+    },
+    additionalProperties: false,
+  }),
+  // ── New: Anti-pattern detector ───────────────────────────────────────────
+  toolDefinition('luau.anti_pattern_detector', ['luau.anti_pattern_detector', 'luau_anti_pattern_detector'], 'Scan for the 10 most common script-breaking errors: uncached GetService in loops, repeated FindFirstChild, unbounded while true, toggle re-entry, unguarded Character, unsafe task.spawn, implicit globals, inline closures in hot paths, multiple Connect without Disconnect, uncached requires.', {
+    type: 'object',
+    properties: {
+      filePath: { type: 'string', description: 'Luau file to scan. If omitted, scans all Luau files.' },
+    },
+    additionalProperties: false,
+  }),
+  // ── New: State table extractor ───────────────────────────────────────────
+  toolDefinition('luau.state_table_extractor', ['luau.state_table_extractor', 'luau_state_table_extractor'], 'Find ALL state tables (Settings, Flags, Config, Toggles, Options, etc.) and return their schema: keys, default values, inferred types, read/write counts, and which functions access them.', {
+    type: 'object',
+    properties: {
+      filePath: { type: 'string', description: 'Luau file to extract state tables from. If omitted, scans all Luau files.' },
+    },
+    additionalProperties: false,
+  }),
+  // ── New: UI scaffold generator ───────────────────────────────────────────
+  toolDefinition('luau.ui_scaffold', ['luau.ui_scaffold', 'luau_ui_scaffold'], 'Given a JSON spec of tabs → sections → controls, generate complete LibSixtyTen UI code with status paragraphs, Toggle/Slider/Dropdown/Button, and callback wiring ready to fill in.', {
+    type: 'object',
+    properties: {
+      spec: { type: 'object', description: 'JSON spec with gameName and tabs object. Each tab contains sections, each section contains control arrays.' },
+    },
+    required: ['spec'],
+    additionalProperties: false,
+  }),
 ];
 
 // ── Public API ────────────────────────────────────────────────────────────────
@@ -2045,6 +2083,106 @@ export async function handleTool(workspaceRoot, requestedName, args = {}) {
       const emFile = args.filePath || findLuauFile(workspaceRoot);
       const emText = emFile ? readText(emFile) : '';
       return textResult(jsonText(buildEventMap(emText, emFile || '')));
+    }
+
+    case 'luau.remote_payload_analyzer': {
+      if (args.filePath) {
+        const resolved = resolveFilePath(workspaceRoot, args.filePath);
+        const text = readText(resolved);
+        return textResult(jsonText(analyzeRemotePayloads(text, resolved)));
+      }
+      // Scan all files
+      const scan = scanLuauWorkspace(workspaceRoot);
+      const results = scan.files.map((f) => {
+        try {
+          const text = readText(f.filePath);
+          return analyzeRemotePayloads(text, f.filePath);
+        } catch { return null; }
+      }).filter(Boolean);
+      return textResult(jsonText({
+        totalFiles: results.length,
+        totalCalls: results.reduce((sum, r) => sum + r.totalCalls, 0),
+        totalUniqueRemotes: results.reduce((sum, r) => sum + r.uniqueRemotes, 0),
+        files: results,
+      }));
+    }
+
+    case 'luau.anti_pattern_detector': {
+      if (args.filePath) {
+        const resolved = resolveFilePath(workspaceRoot, args.filePath);
+        const text = readText(resolved);
+        return textResult(jsonText(detectAntiPatterns(text, resolved)));
+      }
+      // Scan all files
+      const scan = scanLuauWorkspace(workspaceRoot);
+      const results = scan.files.map((f) => {
+        try {
+          const text = readText(f.filePath);
+          return detectAntiPatterns(text, f.filePath);
+        } catch { return null; }
+      }).filter(Boolean);
+      const totalFindings = results.reduce((sum, r) => sum + r.totalFindings, 0);
+      const bySeverity = { critical: 0, high: 0, medium: 0, low: 0, info: 0 };
+      for (const r of results) {
+        for (const [sev, count] of Object.entries(r.bySeverity)) {
+          bySeverity[sev] = (bySeverity[sev] || 0) + count;
+        }
+      }
+      return textResult(jsonText({
+        totalFiles: results.length,
+        totalFindings,
+        bySeverity,
+        files: results.map(r => ({
+          file: r.filePath,
+          antiPatternScore: r.antiPatternScore,
+          totalFindings: r.totalFindings,
+          bySeverity: r.bySeverity,
+          topFindings: r.findings.slice(0, 5).map(f => ({ line: f.line, severity: f.severity, pattern: f.pattern, message: f.message })),
+        })),
+      }));
+    }
+
+    case 'luau.state_table_extractor': {
+      if (args.filePath) {
+        const resolved = resolveFilePath(workspaceRoot, args.filePath);
+        const text = readText(resolved);
+        return textResult(jsonText(extractStateTables(text, resolved)));
+      }
+      // Scan all files
+      const scan = scanLuauWorkspace(workspaceRoot);
+      const results = scan.files.map((f) => {
+        try {
+          const text = readText(f.filePath);
+          return extractStateTables(text, f.filePath);
+        } catch { return null; }
+      }).filter(Boolean);
+      return textResult(jsonText({
+        totalFiles: results.length,
+        totalTables: results.reduce((sum, r) => sum + r.tableCount, 0),
+        files: results.map(r => ({
+          file: r.filePath,
+          tableCount: r.tableCount,
+          tables: r.tables.map(t => ({ name: t.name, line: t.line, keyCount: t.keyCount, role: t.role })),
+        })),
+      }));
+    }
+
+    case 'luau.ui_scaffold': {
+      const spec = args.spec;
+      if (!spec) {
+        return textResult(jsonText({ ok: false, error: 'Missing required parameter: spec. Provide a JSON object with gameName and tabs.' }));
+      }
+      const result = generateUiScaffold(spec);
+      return textResult(jsonText({
+        ok: true,
+        gameName: result.gameName,
+        tabCount: result.tabCount,
+        sectionCount: result.sectionCount,
+        controlCount: result.controlCount,
+        flags: result.flags,
+        codeLines: result.codeLines,
+        code: result.code,
+      }));
     }
 
     default: throw new Error(`Unknown tool: ${requestedName}`);
