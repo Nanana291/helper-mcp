@@ -1820,3 +1820,290 @@ export function compareBrainSnapshots(root, snapshotPathA, snapshotPathB) {
     },
   };
 }
+
+// ── Brain Trends ─────────────────────────────────────────────────────────────
+
+function getWeekNumber(date) {
+  const d = new Date(Date.UTC(date.getFullYear(), date.getMonth(), date.getDate()));
+  const dayNum = d.getUTCDay() || 7;
+  d.setUTCDate(d.getUTCDate() + 4 - dayNum);
+  const yearStart = new Date(Date.UTC(d.getUTCFullYear(), 0, 1));
+  return Math.ceil((((d - yearStart) / 86400000) + 1) / 7);
+}
+
+function formatPeriod(date, bucketSize) {
+  const year = date.getFullYear();
+  const month = String(date.getMonth() + 1).padStart(2, '0');
+  const day = String(date.getDate()).padStart(2, '0');
+  switch (bucketSize) {
+    case 'day':
+      return `${year}-${month}-${day}`;
+    case 'week': {
+      const week = getWeekNumber(date);
+      return `${year}-W${String(week).padStart(2, '0')}`;
+    }
+    case 'month':
+      return `${year}-${month}`;
+    default:
+      return `${year}-${month}-${day}`;
+  }
+}
+
+function getBucketKey(date, bucketSize) {
+  const year = date.getFullYear();
+  const month = date.getMonth();
+  const day = date.getDate();
+  switch (bucketSize) {
+    case 'day':
+      return `${year}-${month}-${day}`;
+    case 'week': {
+      const week = getWeekNumber(date);
+      // Use Monday of that week as canonical key
+      const d = new Date(Date.UTC(year, month, day));
+      const dayOfWeek = d.getUTCDay() || 7;
+      d.setUTCDate(d.getUTCDate() - dayOfWeek + 1);
+      return `${d.getUTCFullYear()}-W${String(week).padStart(2, '0')}`;
+    }
+    case 'month':
+      return `${year}-${month}`;
+    default:
+      return `${year}-${month}-${day}`;
+  }
+}
+
+export function brainTrends(root, options = {}) {
+  const { days = 30, bucketSize = 'week' } = options;
+  const { history } = brainPaths(root);
+
+  const endDate = new Date();
+  const startDate = new Date(endDate.getTime() - days * 86400000);
+
+  // Handle missing history file gracefully
+  if (!fs.existsSync(history)) {
+    return {
+      summary: {
+        window: { days, bucketSize, start: startDate.toISOString(), end: endDate.toISOString() },
+        totalEvents: 0,
+        totalNotes: 0,
+        direction: 'stable',
+      },
+      buckets: [],
+      trends: {
+        creationRate: { total: 0, perWeek: 0, direction: 'stable' },
+        promotionRate: { total: 0, perWeek: 0, direction: 'stable' },
+        deletionRate: { total: 0, perWeek: 0, direction: 'stable' },
+      },
+      topTags: [],
+      statusDistribution: {
+        current: {},
+        previous: {},
+        drift: 'no data',
+      },
+      healthScore: 50,
+    };
+  }
+
+  // Load and filter events
+  const allEvents = loadBrainHistoryEntries(root);
+  const filteredEvents = allEvents.filter((event) => {
+    const eventDate = new Date(event.generatedAt);
+    return eventDate >= startDate && eventDate <= endDate;
+  });
+
+  // Bucket events by time period
+  const bucketMap = new Map();
+  for (const event of filteredEvents) {
+    const eventDate = new Date(event.generatedAt);
+    const key = getBucketKey(eventDate, bucketSize);
+    if (!bucketMap.has(key)) {
+      bucketMap.set(key, {
+        period: formatPeriod(eventDate, bucketSize),
+        created: 0,
+        promoted: 0,
+        deleted: 0,
+        updated: 0,
+        merged: 0,
+        events: [],
+      });
+    }
+    const bucket = bucketMap.get(key);
+    bucket.events.push(event);
+
+    const action = event.action || '';
+    if (action === 'append' || action === 'teach') {
+      bucket.created++;
+    } else if (action === 'promote') {
+      bucket.promoted++;
+    } else if (action === 'delete' || action === 'archive') {
+      bucket.deleted++;
+    } else if (action === 'update') {
+      bucket.updated++;
+    } else if (action === 'merge') {
+      bucket.merged++;
+    }
+  }
+
+  // Sort buckets by period
+  const sortedBuckets = [...bucketMap.entries()]
+    .sort((a, b) => a[0].localeCompare(b[0]))
+    .map(([key, bucket]) => ({
+      period: bucket.period,
+      created: bucket.created,
+      promoted: bucket.promoted,
+      deleted: bucket.deleted,
+      updated: bucket.updated,
+      merged: bucket.merged,
+      netGrowth: bucket.created - bucket.deleted,
+    }));
+
+  // Compute trends: direction comparing first half vs second half
+  const midPoint = Math.ceil(sortedBuckets.length / 2);
+  const firstHalf = sortedBuckets.slice(0, midPoint);
+  const secondHalf = sortedBuckets.slice(midPoint);
+
+  function computeDirection(first, second, metric) {
+    const firstTotal = first.reduce((sum, b) => sum + (b[metric] || 0), 0);
+    const secondTotal = second.reduce((sum, b) => sum + (b[metric] || 0), 0);
+    if (firstTotal === 0 && secondTotal === 0) return 'stable';
+    if (firstTotal === 0) return secondTotal > 0 ? 'up' : 'stable';
+    const ratio = secondTotal / firstTotal;
+    if (ratio > 1.2) return 'up';
+    if (ratio < 0.8) return 'down';
+    return 'stable';
+  }
+
+  const totalCreated = sortedBuckets.reduce((sum, b) => sum + b.created, 0);
+  const totalPromoted = sortedBuckets.reduce((sum, b) => sum + b.promoted, 0);
+  const totalDeleted = sortedBuckets.reduce((sum, b) => sum + b.deleted, 0);
+
+  const weeksFactor = days / 7;
+  const creationDirection = computeDirection(firstHalf, secondHalf, 'created');
+  const promotionDirection = computeDirection(firstHalf, secondHalf, 'promoted');
+  const deletionDirection = computeDirection(firstHalf, secondHalf, 'deleted');
+
+  // Overall direction
+  let overallDirection;
+  if (totalCreated > 0 && totalCreated > totalDeleted * 1.5) {
+    overallDirection = 'growing';
+  } else if (totalDeleted > totalCreated * 1.5) {
+    overallDirection = 'shrinking';
+  } else {
+    overallDirection = 'stable';
+  }
+
+  // Compute tag trends
+  const tagCounts = {};
+  for (const event of filteredEvents) {
+    if (event.action === 'append' || event.action === 'teach') {
+      const note = event.note || event.after;
+      if (note && Array.isArray(note.tags)) {
+        for (const tag of note.tags) {
+          const clean = String(tag).trim().toLowerCase();
+          if (clean) {
+            tagCounts[clean] = (tagCounts[clean] || 0) + 1;
+          }
+        }
+      }
+    }
+  }
+
+  const topTags = Object.entries(tagCounts)
+    .sort((a, b) => b[1] - a[1])
+    .slice(0, 10)
+    .map(([tag, count]) => ({ tag, count }));
+
+  // Compute status distribution
+  // Current status: load notes and count by status
+  const notes = loadNotes(root);
+  const currentStatus = {};
+  for (const note of notes) {
+    const status = String(note.status || 'candidate');
+    currentStatus[status] = (currentStatus[status] || 0) + 1;
+  }
+
+  // Previous status: reconstruct from history at start of window
+  // Track status changes: apply all events before startDate to build previous state
+  const notesBeforeWindow = new Map();
+  const preWindowEvents = allEvents
+    .filter((e) => new Date(e.generatedAt) < startDate)
+    .sort((a, b) => String(a.generatedAt).localeCompare(String(b.generatedAt)));
+
+  for (const event of preWindowEvents) {
+    const action = event.action || '';
+    const noteId = event.noteId || event.after?.id || event.before?.id;
+    if (!noteId) continue;
+
+    if (action === 'append' || action === 'teach') {
+      const note = event.note || event.after;
+      if (note) notesBeforeWindow.set(noteId, { id: noteId, status: String(note.status || 'candidate') });
+    } else if (action === 'promote' || action === 'update') {
+      const after = event.after;
+      if (after) {
+        const existing = notesBeforeWindow.get(noteId) || { id: noteId };
+        existing.status = String(after.status || 'candidate');
+        notesBeforeWindow.set(noteId, existing);
+      }
+    } else if (action === 'delete' || action === 'archive') {
+      const existing = notesBeforeWindow.get(noteId);
+      if (existing) {
+        existing.status = 'archived';
+        notesBeforeWindow.set(noteId, existing);
+      }
+    }
+  }
+
+  const previousStatus = {};
+  for (const note of notesBeforeWindow.values()) {
+    const status = note.status;
+    previousStatus[status] = (previousStatus[status] || 0) + 1;
+  }
+
+  // Drift string
+  const driftParts = [];
+  const allStatuses = new Set([...Object.keys(currentStatus), ...Object.keys(previousStatus)]);
+  for (const status of allStatuses) {
+    const curr = currentStatus[status] || 0;
+    const prev = previousStatus[status] || 0;
+    const diff = curr - prev;
+    if (diff !== 0) {
+      driftParts.push(`${diff > 0 ? '+' : ''}${diff} ${status}`);
+    }
+  }
+  const drift = driftParts.length > 0 ? driftParts.join(', ') : 'no change';
+
+  // Total notes in window
+  const totalNotes = sortedBuckets.reduce((sum, b) => sum + b.netGrowth, 0);
+
+  // Health score calculation
+  let healthScore = 50;
+  if (totalCreated > 0) healthScore += 20;
+  if (totalPromoted > totalDeleted) healthScore += 10;
+  if (overallDirection === 'growing' || overallDirection === 'stable') healthScore += 10;
+  const activeCount = currentStatus['active'] || 0;
+  const candidateCount = currentStatus['candidate'] || 0;
+  if (activeCount > candidateCount) healthScore += 10;
+  if (totalDeleted > totalCreated) healthScore -= 10;
+  healthScore = Math.min(100, Math.max(0, healthScore));
+
+  return {
+    summary: {
+      window: { days, bucketSize, start: startDate.toISOString(), end: endDate.toISOString() },
+      totalEvents: filteredEvents.length,
+      totalNotes: notes.length,
+      direction: overallDirection,
+    },
+    buckets: sortedBuckets,
+    trends: {
+      creationRate: { total: totalCreated, perWeek: Math.round((totalCreated / weeksFactor) * 100) / 100, direction: creationDirection },
+      promotionRate: { total: totalPromoted, perWeek: Math.round((totalPromoted / weeksFactor) * 100) / 100, direction: promotionDirection },
+      deletionRate: { total: totalDeleted, perWeek: Math.round((totalDeleted / weeksFactor) * 100) / 100, direction: deletionDirection },
+    },
+    topTags,
+    statusDistribution: {
+      current: currentStatus,
+      previous: previousStatus,
+      drift,
+    },
+    healthScore,
+  };
+}

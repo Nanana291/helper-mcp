@@ -5083,3 +5083,673 @@ export function extractRemoteDetails(text, filePath = '') {
     orphans,
   };
 }
+
+// ── Batch Fix Luau File ──────────────────────────────────────────────────────
+
+/**
+ * Scans a file and applies ALL fixable risks in a single pass.
+ * Uses existing hotfixLuauText internals (wrapRemoteStatements, insertRateLimitGuards,
+ * prependConnectionCleanup) and adds more fix stages.
+ */
+export function batchFixLuauFile(text, filePath, options = {}) {
+  const source = String(text || '');
+  const { apply = true, stages = [], skipStages = [] } = options;
+
+  const allStages = ['pcall-wrap', 'deprecated-wait', 'deprecated-spawn', 'deprecated-delay', 'rate-limit', 'connection-cleanup', 'loop-guard', 'magic-number'];
+  const activeStages = stages.length > 0
+    ? allStages.filter(s => stages.includes(s))
+    : allStages.filter(s => !skipStages.includes(s));
+
+  const beforeHash = textHash(source);
+  let currentLines = source.split(/\r?\n/);
+  const stageResults = [];
+
+  function runStage(name, fn) {
+    if (!activeStages.includes(name)) return;
+    const result = fn(currentLines);
+    const changed = result.edits.length > 0;
+    stageResults.push({ name, fixes: result.edits.length, edits: result.edits, changed });
+    if (changed) currentLines = result.lines || currentLines;
+  }
+
+  // Stage 1: pcall-wrap (reuse existing internal function)
+  runStage('pcall-wrap', (lines) => wrapRemoteStatements(lines));
+
+  // Stage 2: deprecated-wait
+  runStage('deprecated-wait', (lines) => {
+    const edits = [];
+    const out = lines.map((line, idx) => {
+      if (/\bwait\s*\(/.test(line) && !/\btask\.wait\s*\(/.test(line) && !/^\s*--/.test(line)) {
+        const after = line.replace(/\bwait\s*\(/g, 'task.wait(');
+        edits.push({ line: idx + 1, before: line, after, label: 'deprecated-wait' });
+        return after;
+      }
+      return line;
+    });
+    return { lines: out, edits };
+  });
+
+  // Stage 3: deprecated-spawn
+  runStage('deprecated-spawn', (lines) => {
+    const edits = [];
+    const out = lines.map((line, idx) => {
+      if (/\bspawn\s*\(/.test(line) && !/\btask\.spawn\s*\(/.test(line) && !/^\s*--/.test(line)) {
+        const after = line.replace(/\bspawn\s*\(/g, 'task.spawn(');
+        edits.push({ line: idx + 1, before: line, after, label: 'deprecated-spawn' });
+        return after;
+      }
+      return line;
+    });
+    return { lines: out, edits };
+  });
+
+  // Stage 4: deprecated-delay
+  runStage('deprecated-delay', (lines) => {
+    const edits = [];
+    const out = lines.map((line, idx) => {
+      if (/\bdelay\s*\(/.test(line) && !/\btask\.delay\s*\(/.test(line) && !/^\s*--/.test(line)) {
+        const after = line.replace(/\bdelay\s*\(/g, 'task.delay(');
+        edits.push({ line: idx + 1, before: line, after, label: 'deprecated-delay' });
+        return after;
+      }
+      return line;
+    });
+    return { lines: out, edits };
+  });
+
+  // Stage 5: rate-limit (reuse existing internal function)
+  runStage('rate-limit', (lines) => insertRateLimitGuards(lines));
+
+  // Stage 6: connection-cleanup (reuse existing internal function on joined text)
+  runStage('connection-cleanup', (lines) => {
+    const currentText = lines.join('\n');
+    const result = prependConnectionCleanup(lines, currentText);
+    // Re-label edits for clarity
+    for (const edit of result.edits) {
+      edit.label = 'connection-cleanup';
+    }
+    return result;
+  });
+
+  // Stage 7: loop-guard — add character guard after `while true do`
+  runStage('loop-guard', (lines) => {
+    const edits = [];
+    const guardRe = /while\s+true\s+do\b/;
+    const charGuardRe = /FindFirstChild\s*\(\s*["']HumanoidRootPart["']\s*\)/;
+    const out = [];
+    for (let i = 0; i < lines.length; i++) {
+      out.push(lines[i]);
+      if (guardRe.test(lines[i]) && !/^\s*--/.test(lines[i])) {
+        // Check next 20 lines for character guard
+        let hasGuard = false;
+        for (let j = i + 1; j < Math.min(i + 21, lines.length); j++) {
+          if (charGuardRe.test(lines[j])) { hasGuard = true; break; }
+          if (/^\s*end\s*$/.test(lines[j])) break;
+        }
+        if (!hasGuard) {
+          const indent = lines[i].match(/^\s*/)?.[0] || '';
+          const guard = `${indent}if not Character or not Character:FindFirstChild("HumanoidRootPart") then task.wait(0.1) continue end`;
+          out.push(guard);
+          edits.push({ line: i + 1, before: lines[i], after: guard, label: 'loop-guard' });
+        }
+      }
+    }
+    return { lines: out, edits };
+  });
+
+  // Stage 8: magic-number — flag but don't fix
+  runStage('magic-number', (lines) => {
+    const edits = [];
+    for (let i = 0; i < lines.length; i++) {
+      const trimmed = lines[i].trim();
+      if (/^\s*--/.test(trimmed)) continue;
+      const numRe = /\b(\d{5,})\b/g;
+      let m;
+      while ((m = numRe.exec(trimmed)) !== null) {
+        const num = parseInt(m[1], 10);
+        if (num > 99999) {
+          edits.push({
+            line: i + 1,
+            before: trimmed,
+            after: `-- MAGIC-NUMBER: ${m[1]} — consider using a named constant`,
+            label: 'magic-number',
+          });
+        }
+      }
+    }
+    return { lines, edits };
+  });
+
+  const afterText = currentLines.join('\n');
+  const afterHash = textHash(afterText);
+  const totalFixes = stageResults.reduce((sum, s) => sum + s.fixes, 0);
+  const stagesApplied = stageResults.filter(s => s.fixes > 0).length;
+
+  let recommendation;
+  if (totalFixes === 0) {
+    recommendation = 'No fixes needed across all stages.';
+  } else {
+    recommendation = `${totalFixes} fix(es) applied across ${stagesApplied} stage(s).`;
+  }
+
+  const finalAfter = apply ? afterText : source;
+
+  return {
+    filePath: toPosix(filePath),
+    summary: {
+      stages: allStages.length,
+      stagesApplied,
+      totalFixes,
+      beforeHash,
+      afterHash,
+      changed: afterText !== source,
+    },
+    stages: stageResults,
+    after: finalAfter,
+    applied: apply,
+    recommendation,
+  };
+}
+
+// ── UI Audit Luau ────────────────────────────────────────────────────────────
+
+/**
+ * Validates LibSixtyTen/Obsidian UI scripts for common issues.
+ */
+export function uiAuditLuau(text, filePath = '') {
+  const source = String(text || '');
+  const lines = source.split(/\r?\n/);
+  const checks = [];
+  const recommendations = [];
+  const flags = extractFlagsFromText(source, filePath);
+  const uiMap = extractUIMap(source, filePath);
+
+  // Detect UI library
+  let uiLibrary = 'Unknown';
+  if (/LibSixtyTen/.test(source) || /Library:Window\s*\(/.test(source)) {
+    uiLibrary = 'LibSixtyTen';
+  }
+  if (/Obsidian/.test(source) || /Library:CreateWindow\s*\(/.test(source)) {
+    uiLibrary = 'Obsidian';
+  }
+  if (/loadstring.*LibSixtyTen/.test(source)) uiLibrary = 'LibSixtyTen';
+  if (/loadstring.*Obsidian/.test(source)) uiLibrary = 'Obsidian';
+
+  // Count UI sections
+  const sectionNames = [];
+  const sectionRe = /:\s*(Page|Category|Section)\s*\(\s*(?:\{[^}]*Name\s*=\s*["']([^"']+)["']|["']([^"']+)["'])/g;
+  let sm;
+  while ((sm = sectionRe.exec(source)) !== null) {
+    sectionNames.push(sm[2] || sm[3] || '?');
+  }
+  const totalSections = sectionNames.length;
+
+  // ── Check 1: status-paragraphs ─────────────────────────────────────────
+  const hasBuildBasic = /BuildBasicStatus\s*\(/.test(source);
+  const hasBuildDetailed = /BuildDetailedStatus\s*\(/.test(source);
+  const hasStatusColors = /STATUS_COLORS/.test(source);
+  const hasSetText = /SetText\s*\(/.test(source);
+  const hasParagraph = /:\s*Paragraph\s*\(/.test(source);
+
+  if (hasBuildBasic || hasBuildDetailed) {
+    if (!hasSetText) {
+      checks.push({
+        check: 'status-paragraphs',
+        pass: false,
+        severity: 'warning',
+        detail: 'Status builder functions found but no SetText calls — status paragraphs are not being updated.',
+      });
+      recommendations.push('Add SetText calls to update status paragraphs with real-time state.');
+    } else {
+      checks.push({ check: 'status-paragraphs', pass: true, severity: 'info', detail: 'Status builders and SetText calls present.' });
+    }
+    if (!hasStatusColors) {
+      checks.push({
+        check: 'status-colors',
+        pass: false,
+        severity: 'error',
+        detail: 'STATUS_COLORS constant missing — status colors may be inconsistent.',
+      });
+      recommendations.push('Define a STATUS_COLORS table for consistent status color theming.');
+    } else {
+      checks.push({ check: 'status-colors', pass: true, severity: 'info', detail: 'STATUS_COLORS constant present.' });
+    }
+  } else if (hasParagraph) {
+    checks.push({
+      check: 'status-paragraphs',
+      pass: false,
+      severity: 'warning',
+      detail: 'Paragraph declarations found but no BuildBasicStatus or BuildDetailedStatus builders.',
+    });
+    recommendations.push('Use BuildBasicStatus or BuildDetailedStatus for consistent status formatting.');
+  } else {
+    checks.push({ check: 'status-paragraphs', pass: false, severity: 'info', detail: 'No status paragraph patterns detected.' });
+  }
+
+  // ── Check 2: flag-naming ───────────────────────────────────────────────
+  const flagNames = flags.allFlags.map(f => f.name);
+  const duplicateFlags = flagNames.filter((name, idx) => flagNames.indexOf(name) !== idx);
+  const uniqueDuplicates = [...new Set(duplicateFlags)];
+
+  const namingIssues = [];
+  const knownPrefixes = ['Farm_', 'Esp_', 'Teleport_', 'Combat_', 'Auto_', 'Misc_', 'Settings_', 'Player_', 'UI_', 'Orbit_', 'Block_', 'Skill_', 'Return_', 'Target_', 'Walk_', 'Jump_'];
+
+  for (const fname of flagNames) {
+    // Check for snake_case vs camelCase inconsistency
+    if (fname.includes('_') && !knownPrefixes.some(p => fname.startsWith(p))) {
+      namingIssues.push(`Flag "${fname}" uses underscore — prefer PascalCase with prefix.`);
+    }
+    // Check for missing system prefix
+    if (!knownPrefixes.some(p => fname.startsWith(p))) {
+      // Only flag if it looks like a feature flag (not a generic name)
+      if (fname.length > 3 && !/^[A-Z]/.test(fname)) {
+        namingIssues.push(`Flag "${fname}" missing system prefix (e.g., Farm_, Esp_, Teleport_).`);
+      }
+    }
+  }
+
+  if (uniqueDuplicates.length > 0) {
+    checks.push({
+      check: 'flag-naming',
+      pass: false,
+      severity: 'error',
+      detail: `${uniqueDuplicates.length} duplicate Flag value(s): [${uniqueDuplicates.join(', ')}] — controls will share state.`,
+    });
+    recommendations.push(`Remove duplicate Flag values: ${uniqueDuplicates.join(', ')}.`);
+  } else if (namingIssues.length > 0) {
+    checks.push({
+      check: 'flag-naming',
+      pass: false,
+      severity: 'warning',
+      detail: `${namingIssues.length} flag naming issue(s): ${namingIssues.slice(0, 3).join('; ')}${namingIssues.length > 3 ? '...' : ''}`,
+    });
+    recommendations.push('Standardize flag names to PascalCase with consistent prefixes.');
+  } else {
+    checks.push({ check: 'flag-naming', pass: true, severity: 'info', detail: 'Flag names look consistent.' });
+  }
+
+  // ── Check 3: ui-duplicates ─────────────────────────────────────────────
+  const duplicateSections = sectionNames.filter((name, idx) => sectionNames.indexOf(name) !== idx);
+  const uniqueDuplicateSections = [...new Set(duplicateSections)];
+
+  if (uniqueDuplicateSections.length > 0) {
+    checks.push({
+      check: 'ui-duplicates',
+      pass: false,
+      severity: 'error',
+      detail: `Duplicate UI section(s): [${uniqueDuplicateSections.join(', ')}].`,
+    });
+    recommendations.push(`Rename or merge duplicate UI sections: ${uniqueDuplicateSections.join(', ')}.`);
+  } else {
+    checks.push({ check: 'ui-duplicates', pass: true, severity: 'info', detail: 'No duplicate UI sections found.' });
+  }
+
+  // ── Check 4: mobile-first ──────────────────────────────────────────────
+  const mobileIssues = [];
+  for (let i = 0; i < lines.length; i++) {
+    const line = lines[i];
+    if (/\.hover\b/.test(line) && !/^\s*--/.test(line)) {
+      mobileIssues.push(`L${i + 1}: hover dependency — does not work on mobile: ${line.trim().slice(0, 80)}`);
+    }
+    if (/MouseButton1Click/.test(line) && !/TouchTap/.test(line)) {
+      // Check nearby lines for TouchTap fallback
+      const nearby = lines.slice(Math.max(0, i - 3), Math.min(lines.length, i + 3)).join('\n');
+      if (!/TouchTap|TouchEnded/.test(nearby)) {
+        mobileIssues.push(`L${i + 1}: MouseButton1Click without TouchTap fallback — limited mobile support.`);
+      }
+    }
+  }
+
+  if (mobileIssues.length > 0) {
+    checks.push({
+      check: 'mobile-first',
+      pass: false,
+      severity: 'warning',
+      detail: `${mobileIssues.length} mobile compatibility issue(s).`,
+      line: parseInt(mobileIssues[0].match(/L(\d+)/)?.[1] || '0', 10),
+    });
+    recommendations.push('Replace hover patterns with touch-compatible alternatives for mobile support.');
+  } else {
+    checks.push({ check: 'mobile-first', pass: true, severity: 'info', detail: 'No mobile compatibility issues found.' });
+  }
+
+  // ── Check 5: section-adapter ───────────────────────────────────────────
+  const hasSectionAdapter = /SectionAdapter/.test(source);
+  if (!hasSectionAdapter && (uiLibrary === 'LibSixtyTen' || /loadstring.*LibSixtyTen/.test(source))) {
+    checks.push({
+      check: 'section-adapter',
+      pass: false,
+      severity: 'warning',
+      detail: 'LibSixtyTen detected but no SectionAdapter pattern — sections may lack unified control interface.',
+    });
+    recommendations.push('Add SectionAdapter pattern for consistent section control management.');
+  } else {
+    checks.push({ check: 'section-adapter', pass: true, severity: 'info', detail: hasSectionAdapter ? 'SectionAdapter pattern present.' : 'SectionAdapter not required for this UI library.' });
+  }
+
+  // ── Check 6: theme-save ────────────────────────────────────────────────
+  const hasThemeManager = /ThemeManager/.test(source);
+  const hasSaveManager = /SaveManager/.test(source);
+  if (!hasThemeManager || !hasSaveManager) {
+    const missing = [];
+    if (!hasThemeManager) missing.push('ThemeManager');
+    if (!hasSaveManager) missing.push('SaveManager');
+    checks.push({
+      check: 'theme-save',
+      pass: false,
+      severity: 'info',
+      detail: `${missing.join(' and ')} not found — no theme persistence or config saving.`,
+    });
+    recommendations.push('Integrate ThemeManager and SaveManager for config persistence and theming.');
+  } else {
+    checks.push({ check: 'theme-save', pass: true, severity: 'info', detail: 'ThemeManager and SaveManager integrated.' });
+  }
+
+  // ── Check 7: loadstring-safe ───────────────────────────────────────────
+  const loadstringCalls = [];
+  for (let i = 0; i < lines.length; i++) {
+    const line = lines[i];
+    if (/loadstring\s*\(\s*(?:game\s*:\s*HttpGet|game\.HttpGet)/.test(line)) {
+      // Check if wrapped in pcall
+      let inPcall = false;
+      for (let j = Math.max(0, i - 3); j <= i; j++) {
+        if (/\bpcall\b/.test(lines[j]) || /\bpcallRef\b/.test(lines[j])) {
+          inPcall = true;
+          break;
+        }
+      }
+      loadstringCalls.push({ line: i + 1, inPcall });
+    }
+  }
+
+  const unsafeLoadstrings = loadstringCalls.filter(c => !c.inPcall);
+  if (unsafeLoadstrings.length > 0) {
+    checks.push({
+      check: 'loadstring-safe',
+      pass: false,
+      severity: 'error',
+      detail: `${unsafeLoadstrings.length} loadstring(game:HttpGet...) call(s) without pcall wrapper.`,
+      line: unsafeLoadstrings[0].line,
+    });
+    recommendations.push('Wrap loadstring(game:HttpGet...) calls in pcall for safe loading.');
+  } else if (loadstringCalls.length > 0) {
+    checks.push({ check: 'loadstring-safe', pass: true, severity: 'info', detail: 'All loadstring(game:HttpGet...) calls are pcall-wrapped.' });
+  } else {
+    checks.push({ check: 'loadstring-safe', pass: true, severity: 'info', detail: 'No loadstring(game:HttpGet...) calls detected.' });
+  }
+
+  // ── Compute verdict ────────────────────────────────────────────────────
+  const errors = checks.filter(c => !c.pass && c.severity === 'error');
+  const warnings = checks.filter(c => !c.pass && c.severity === 'warning');
+  const passed = checks.filter(c => c.pass);
+
+  let verdict = 'PASS';
+  if (errors.length > 0) verdict = 'FAIL';
+  else if (warnings.length > 0) verdict = 'WARN';
+
+  return {
+    filePath: toPosix(filePath),
+    verdict,
+    summary: {
+      totalChecks: checks.length,
+      passed: passed.length,
+      warnings: warnings.length,
+      failures: errors.length,
+      uiLibrary,
+      totalSections,
+      totalFlags: flagNames.length,
+    },
+    checks,
+    flags: {
+      total: flagNames.length,
+      duplicates: uniqueDuplicates,
+      namingIssues,
+    },
+    uiSections: {
+      total: totalSections,
+      duplicates: uniqueDuplicateSections,
+      mobileIssues,
+    },
+    recommendations,
+  };
+}
+
+// ── Performance Budget Luau ──────────────────────────────────────────────────
+
+/**
+ * Defines performance budgets and scans all Luau files to find violations.
+ */
+export function performanceBudgetLuau(root, options = {}) {
+  const { budgets: customBudgets = {}, targetPath = '' } = options;
+
+  const defaultBudgets = {
+    maxLocals: 180,
+    maxCallbacks: 20,
+    maxRemotes: 50,
+    maxLoops: 5,
+    maxConnections: 10,
+    maxLines: 1500,
+    maxRisks: 10,
+    maxOrphanedConnections: 0,
+  };
+
+  const limits = { ...defaultBudgets, ...customBudgets };
+
+  // Scan workspace
+  const scan = scanLuauWorkspace(root);
+  const files = scan.files || [];
+
+  // Filter by targetPath if specified
+  const filteredFiles = targetPath
+    ? files.filter(f => {
+        const rel = f.filePath;
+        return rel === targetPath || rel.startsWith(`${targetPath}/`);
+      })
+    : files;
+
+  const fileResults = [];
+  const budgetUsage = {};
+
+  // Initialize budget tracking
+  for (const key of Object.keys(limits)) {
+    budgetUsage[key] = { limit: limits[key], used: 0, worstFile: '', worstValue: 0 };
+  }
+
+  let filesWithinBudget = 0;
+  let filesOverBudget = 0;
+
+  for (const entry of filteredFiles) {
+    const violations = [];
+    const resolvedPath = entry.filePath;
+
+    // Parse the actual file text for more detailed counts
+    const fullFilePath = path.isAbsolute(resolvedPath) ? resolvedPath : path.join(root, resolvedPath);
+    const fileText = readText(fullFilePath);
+    const fileLines = fileText ? fileText.split(/\r?\n/) : [];
+    const lineCount = fileLines.length;
+
+    // maxLines
+    if (lineCount > limits.maxLines) {
+      const pct = Math.round((lineCount / limits.maxLines) * 100);
+      violations.push({
+        budget: 'maxLines',
+        limit: limits.maxLines,
+        actual: lineCount,
+        severity: pct > 150 ? 'critical' : 'warning',
+      });
+    }
+    if (lineCount > budgetUsage.maxLines.worstValue) {
+      budgetUsage.maxLines.used = lineCount;
+      budgetUsage.maxLines.worstFile = resolvedPath;
+      budgetUsage.maxLines.worstValue = lineCount;
+    }
+
+    // maxLocals
+    const localCount = entry.summary.localCount || 0;
+    if (localCount > limits.maxLocals) {
+      const pct = Math.round((localCount / limits.maxLocals) * 100);
+      violations.push({
+        budget: 'maxLocals',
+        limit: limits.maxLocals,
+        actual: localCount,
+        severity: pct > 150 ? 'critical' : 'warning',
+      });
+    }
+    if (localCount > budgetUsage.maxLocals.worstValue) {
+      budgetUsage.maxLocals.used = localCount;
+      budgetUsage.maxLocals.worstFile = resolvedPath;
+      budgetUsage.maxLocals.worstValue = localCount;
+    }
+
+    // maxCallbacks
+    const callbackCount = entry.summary.callbackCount || 0;
+    if (callbackCount > limits.maxCallbacks) {
+      const pct = Math.round((callbackCount / limits.maxCallbacks) * 100);
+      violations.push({
+        budget: 'maxCallbacks',
+        limit: limits.maxCallbacks,
+        actual: callbackCount,
+        severity: pct > 150 ? 'critical' : 'warning',
+      });
+    }
+    if (callbackCount > budgetUsage.maxCallbacks.worstValue) {
+      budgetUsage.maxCallbacks.used = callbackCount;
+      budgetUsage.maxCallbacks.worstFile = resolvedPath;
+      budgetUsage.maxCallbacks.worstValue = callbackCount;
+    }
+
+    // maxRemotes
+    const remoteCount = entry.summary.remoteCount || 0;
+    if (remoteCount > limits.maxRemotes) {
+      const pct = Math.round((remoteCount / limits.maxRemotes) * 100);
+      violations.push({
+        budget: 'maxRemotes',
+        limit: limits.maxRemotes,
+        actual: remoteCount,
+        severity: pct > 150 ? 'critical' : 'warning',
+      });
+    }
+    if (remoteCount > budgetUsage.maxRemotes.worstValue) {
+      budgetUsage.maxRemotes.used = remoteCount;
+      budgetUsage.maxRemotes.worstFile = resolvedPath;
+      budgetUsage.maxRemotes.worstValue = remoteCount;
+    }
+
+    // maxLoops — count while/for/repeat
+    const loopCount = (fileText.match(/\bwhile\s+/g) || []).length + (fileText.match(/\bfor\s+/g) || []).length + (fileText.match(/\brepeat\s+/g) || []).length;
+    if (loopCount > limits.maxLoops) {
+      const pct = Math.round((loopCount / limits.maxLoops) * 100);
+      violations.push({
+        budget: 'maxLoops',
+        limit: limits.maxLoops,
+        actual: loopCount,
+        severity: pct > 150 ? 'critical' : 'warning',
+      });
+    }
+    if (loopCount > budgetUsage.maxLoops.worstValue) {
+      budgetUsage.maxLoops.used = loopCount;
+      budgetUsage.maxLoops.worstFile = resolvedPath;
+      budgetUsage.maxLoops.worstValue = loopCount;
+    }
+
+    // maxConnections — count Connect calls
+    const connectionCount = entry.summary.connectCount || (fileText.match(/\bConnect\s*\(/g) || []).length;
+    if (connectionCount > limits.maxConnections) {
+      const pct = Math.round((connectionCount / limits.maxConnections) * 100);
+      violations.push({
+        budget: 'maxConnections',
+        limit: limits.maxConnections,
+        actual: connectionCount,
+        severity: pct > 150 ? 'critical' : 'warning',
+      });
+    }
+    if (connectionCount > budgetUsage.maxConnections.worstValue) {
+      budgetUsage.maxConnections.used = connectionCount;
+      budgetUsage.maxConnections.worstFile = resolvedPath;
+      budgetUsage.maxConnections.worstValue = connectionCount;
+    }
+
+    // maxRisks
+    const riskCount = entry.summary.riskCount || 0;
+    if (riskCount > limits.maxRisks) {
+      const pct = Math.round((riskCount / limits.maxRisks) * 100);
+      violations.push({
+        budget: 'maxRisks',
+        limit: limits.maxRisks,
+        actual: riskCount,
+        severity: pct > 150 ? 'critical' : 'warning',
+      });
+    }
+    if (riskCount > budgetUsage.maxRisks.worstValue) {
+      budgetUsage.maxRisks.used = riskCount;
+      budgetUsage.maxRisks.worstFile = resolvedPath;
+      budgetUsage.maxRisks.worstValue = riskCount;
+    }
+
+    // maxOrphanedConnections — check for Connect without Disconnect
+    const disconnectCount = (fileText.match(/\bDisconnect\s*\(/g) || []).length;
+    const taskCancelCount = (fileText.match(/\btask\.cancel\b/g) || []).length;
+    const orphanedConnections = connectionCount > 0 && (disconnectCount + taskCancelCount) === 0 ? connectionCount : 0;
+    if (orphanedConnections > limits.maxOrphanedConnections) {
+      violations.push({
+        budget: 'maxOrphanedConnections',
+        limit: limits.maxOrphanedConnections,
+        actual: orphanedConnections,
+        severity: orphanedConnections > 3 ? 'critical' : 'warning',
+      });
+    }
+    if (orphanedConnections > budgetUsage.maxOrphanedConnections.worstValue) {
+      budgetUsage.maxOrphanedConnections.used = orphanedConnections;
+      budgetUsage.maxOrphanedConnections.worstFile = resolvedPath;
+      budgetUsage.maxOrphanedConnections.worstValue = orphanedConnections;
+    }
+
+    const withinBudget = violations.length === 0;
+    if (withinBudget) filesWithinBudget++;
+    else filesOverBudget++;
+
+    fileResults.push({
+      filePath: resolvedPath,
+      lineCount,
+      withinBudget,
+      violations,
+    });
+  }
+
+  // Build worst offenders list
+  const worstOffenders = fileResults
+    .filter(f => f.violations.length > 0)
+    .sort((a, b) => b.violations.length - a.violations.length)
+    .slice(0, 5)
+    .map(f => ({
+      filePath: f.filePath,
+      violationCount: f.violations.length,
+      worstViolations: f.violations.slice(0, 5),
+    }));
+
+  // Calculate budget health
+  const totalFiles = fileResults.length;
+  const budgetHealth = totalFiles > 0 ? Math.round((filesWithinBudget / totalFiles) * 100) : 100;
+
+  // Build recommendation
+  let recommendation;
+  if (filesOverBudget === 0) {
+    recommendation = `All ${totalFiles} file(s) are within performance budgets.`;
+  } else {
+    const topOffender = worstOffenders[0];
+    recommendation = `${filesOverBudget}/${totalFiles} file(s) exceed budgets. Worst offender: ${topOffender?.filePath || 'N/A'} with ${topOffender?.violationCount || 0} violation(s).`;
+  }
+
+  return {
+    summary: {
+      totalFiles,
+      filesWithinBudget,
+      filesOverBudget,
+      budgetHealth,
+      budgets: budgetUsage,
+    },
+    files: fileResults,
+    worstOffenders,
+    recommendation,
+  };
+}

@@ -31,6 +31,7 @@ import {
   listBrainFindings,
   updateBrainFinding,
   brainFindingStats,
+  brainTrends,
 } from './brain.mjs';
 import {
   analyzeLuauText,
@@ -85,6 +86,9 @@ import {
   generateV2Scaffold,
   bridgeLuauCommandResult,
   writeLuauHotfixSnapshots,
+  batchFixLuauFile,
+  uiAuditLuau,
+  performanceBudgetLuau,
 } from './luau.mjs';
 import { buildConfigValidationMarkdown, saveConfigValidation, validateConfigFile } from './config.mjs';
 import { captureLuauMetrics } from './metrics.mjs';
@@ -240,6 +244,7 @@ function toolAnnotations(canonicalName) {
     'luau.decompile', 'luau.security_scan', 'luau.performance_profile', 'luau.dependencies', 'luau.remotes', 'luau.complexity',
     'luau.taint', 'luau.flow', 'luau.handlers', 'luau.surface', 'luau.refactor', 'luau.modulegraph', 'luau.risk_score', 'luau.diff_context',
     'luau.explain', 'luau.respawn_simulate', 'luau.grep', 'luau.extract_remote',
+    'luau.ui_audit', 'luau.performance_budget', 'brain.trends',
     'workspace.gate',
     'brain.compare',
   ]);
@@ -1170,6 +1175,50 @@ const toolDefinitions = [
     required: ['targetDir'],
     additionalProperties: false,
   }),
+  // ── New: Luau batch fix ────────────────────────────────────────────────────
+  toolDefinition('luau.batch_fix', ['luau.batch_fix', 'luau_batch_fix'], 'Scan a Luau file and apply ALL fixable risks in a single pass: pcall-wrap, deprecated API, rate-limit, connection-cleanup, loop-guard.', {
+    type: 'object',
+    properties: {
+      filePath: { type: 'string' },
+      apply: { type: 'boolean', description: 'Write fixes to disk. Default true.' },
+      stages: { type: 'array', items: { type: 'string' }, description: 'Only run these stages. Default: all.' },
+      skipStages: { type: 'array', items: { type: 'string' }, description: 'Skip these stages.' },
+    },
+    required: ['filePath'],
+    additionalProperties: false,
+  }),
+  // ── New: Luau UI audit ─────────────────────────────────────────────────────
+  toolDefinition('luau.ui_audit', ['luau.ui_audit', 'luau_ui_audit'], 'Validate LibSixtyTen/Obsidian UI scripts: status paragraphs, flag naming, duplicate sections, mobile-first, section adapter, theme/save integration.', {
+    type: 'object',
+    properties: {
+      filePath: { type: 'string', description: 'File to audit. If omitted, scans all Luau files.' },
+    },
+    additionalProperties: false,
+  }),
+  // ── New: Luau performance budget ───────────────────────────────────────────
+  toolDefinition('luau.performance_budget', ['luau.performance_budget', 'luau_performance_budget'], 'Define performance budgets and scan all Luau files for violations: locals, callbacks, remotes, loops, connections, lines, risks.', {
+    type: 'object',
+    properties: {
+      targetPath: { type: 'string', description: 'Scope to a file or directory.' },
+      maxLocals: { type: 'number', description: 'Max locals per file. Default 180.' },
+      maxCallbacks: { type: 'number', description: 'Max callbacks per file. Default 20.' },
+      maxRemotes: { type: 'number', description: 'Max remotes per file. Default 50.' },
+      maxLoops: { type: 'number', description: 'Max loops per file. Default 5.' },
+      maxConnections: { type: 'number', description: 'Max connections per file. Default 10.' },
+      maxLines: { type: 'number', description: 'Max lines per file. Default 1500.' },
+      maxRisks: { type: 'number', description: 'Max risks per file. Default 10.' },
+    },
+    additionalProperties: false,
+  }),
+  // ── New: Brain trends ──────────────────────────────────────────────────────
+  toolDefinition('brain.trends', ['brain.trends', 'brain_trends'], 'Show brain evolution over time: note creation/promotion/deletion rates, tag trends, status drift, health score.', {
+    type: 'object',
+    properties: {
+      days: { type: 'number', description: 'Lookback window in days. Default 30.' },
+      bucketSize: { type: 'string', description: 'Bucket granularity: day, week, or month. Default week.' },
+    },
+    additionalProperties: false,
+  }),
 ];
 
 // ── Public API ────────────────────────────────────────────────────────────────
@@ -1879,6 +1928,74 @@ export async function handleTool(workspaceRoot, requestedName, args = {}) {
         includeMetrics: args.includeMetrics !== false,
         luauOnly: args.luauOnly || false,
         fileFilter: args.fileFilter,
+      })));
+    }
+
+    case 'luau.batch_fix': {
+      const resolved = resolveFilePath(workspaceRoot, args.filePath);
+      const text = readText(resolved);
+      const report = batchFixLuauFile(text, resolved, {
+        apply: args.apply !== false,
+        stages: args.stages,
+        skipStages: args.skipStages,
+      });
+      if (args.apply !== false && report.summary.changed) {
+        writeText(resolved, `${report.after.trimEnd()}\n`);
+      }
+      return textResult(jsonText({
+        ok: true,
+        applied: args.apply !== false,
+        filePath: resolved,
+        ...report,
+      }));
+    }
+
+    case 'luau.ui_audit': {
+      if (args.filePath) {
+        const resolved = resolveFilePath(workspaceRoot, args.filePath);
+        const text = readText(resolved);
+        return textResult(jsonText(uiAuditLuau(text, resolved)));
+      }
+      // Scan all files
+      const scan = scanLuauWorkspace(workspaceRoot);
+      const results = scan.files.map((f) => {
+        try {
+          const text = readText(f.filePath);
+          return uiAuditLuau(text, f.filePath);
+        } catch { return null; }
+      }).filter(Boolean);
+      const verdicts = { pass: 0, warn: 0, fail: 0 };
+      for (const r of results) {
+        if (r.verdict === 'PASS') verdicts.pass++;
+        else if (r.verdict === 'WARN') verdicts.warn++;
+        else verdicts.fail++;
+      }
+      return textResult(jsonText({
+        totalFiles: results.length,
+        verdicts,
+        files: results,
+      }));
+    }
+
+    case 'luau.performance_budget': {
+      return textResult(jsonText(performanceBudgetLuau(workspaceRoot, {
+        targetPath: args.targetPath,
+        budgets: {
+          maxLocals: args.maxLocals,
+          maxCallbacks: args.maxCallbacks,
+          maxRemotes: args.maxRemotes,
+          maxLoops: args.maxLoops,
+          maxConnections: args.maxConnections,
+          maxLines: args.maxLines,
+          maxRisks: args.maxRisks,
+        },
+      })));
+    }
+
+    case 'brain.trends': {
+      return textResult(jsonText(brainTrends(workspaceRoot, {
+        days: args.days,
+        bucketSize: args.bucketSize,
       })));
     }
 

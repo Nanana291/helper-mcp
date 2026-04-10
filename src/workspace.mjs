@@ -310,6 +310,48 @@ export function restoreWorkspaceSnapshot(root, { snapshotPath = '', targetPath =
   return rollbackWorkspaceSnapshot(root, { snapshotPath, targetPath, apply });
 }
 
+function resolveGateOptions(options) {
+  const preset = options.preset || 'normal';
+  const presets = {
+    strict: {
+      maxRiskDelta: 0,
+      minPcallCoverage: 95,
+      maxNewRisks: 0,
+      requireBaseline: true,
+      maxLocalPressure: 150,
+      requireBrainCoverage: 50,
+    },
+    normal: {
+      maxRiskDelta: 5,
+      minPcallCoverage: 80,
+      maxNewRisks: 3,
+      requireBaseline: false,
+      maxLocalPressure: 180,
+      requireBrainCoverage: 0,
+    },
+    lenient: {
+      maxRiskDelta: 20,
+      minPcallCoverage: 50,
+      maxNewRisks: 10,
+      requireBaseline: false,
+      maxLocalPressure: 200,
+      requireBrainCoverage: 0,
+    },
+  };
+  const defaults = presets[preset] || presets.normal;
+  // Merge: explicit options override defaults
+  return {
+    ...options,
+    maxRiskDelta: options.maxRiskDelta ?? defaults.maxRiskDelta,
+    minPcallCoverage: options.minPcallCoverage ?? defaults.minPcallCoverage,
+    maxNewRisks: options.maxNewRisks ?? defaults.maxNewRisks,
+    requireBaseline: options.requireBaseline ?? defaults.requireBaseline,
+    maxLocalPressure: options.maxLocalPressure ?? defaults.maxLocalPressure,
+    requireBrainCoverage: options.requireBrainCoverage ?? defaults.requireBrainCoverage,
+    preset,
+  };
+}
+
 // ── Delivery Gate ───────────────────────────────────────────────────────────
 
 function checkBaselineParity(root, options) {
@@ -427,11 +469,12 @@ function checkPcallCoverage(scan, options) {
   };
 }
 
-function checkLocalPressure(scan) {
+function checkLocalPressure(scan, options) {
+  const { maxLocalPressure = 180 } = options;
   const warnings = [];
   for (const file of scan.files || []) {
     const localCount = file.summary?.localCount ?? file.locals ?? 0;
-    if (localCount > 180) {
+    if (localCount > maxLocalPressure) {
       warnings.push(`${file.filePath}: ${localCount} locals`);
     }
   }
@@ -441,8 +484,28 @@ function checkLocalPressure(scan) {
     pass,
     severity: 'warning',
     detail: pass
-      ? 'All files within local variable pressure limits (<=180).'
+      ? `All files within local variable pressure limits (<=${maxLocalPressure}).`
       : `High local pressure in ${warnings.length} file(s): ${warnings.join('; ')}`,
+  };
+}
+
+function checkLocalPressureCritical(scan) {
+  const LUAU_REGISTER_LIMIT = 200;
+  const blockers = [];
+  for (const file of scan.files || []) {
+    const localCount = file.summary?.localCount ?? file.locals ?? 0;
+    if (localCount > LUAU_REGISTER_LIMIT) {
+      blockers.push(`${file.filePath}: ${localCount} locals (exceeds register limit of ${LUAU_REGISTER_LIMIT})`);
+    }
+  }
+  const pass = blockers.length === 0;
+  return {
+    check: 'local-pressure-critical',
+    pass,
+    severity: 'blocker',
+    detail: pass
+      ? 'All files within Luau register limits (<=200).'
+      : `Critical local pressure in ${blockers.length} file(s): ${blockers.join('; ')}`,
   };
 }
 
@@ -506,6 +569,52 @@ async function checkBrainCoverage(root, options) {
   };
 }
 
+async function checkBrainCoverageMin(root, options) {
+  const { requireBrainCoverage = 0 } = options;
+  if (requireBrainCoverage <= 0) {
+    return {
+      check: 'brain-coverage-min',
+      pass: true,
+      severity: 'info',
+      detail: 'No minimum brain coverage required (requireBrainCoverage is 0).',
+      brainCoverage: 0,
+    };
+  }
+  let brainNotes;
+  try {
+    const { listBrainNotes } = await import('./brain.mjs');
+    brainNotes = listBrainNotes(root, { limit: 500 });
+  } catch {
+    brainNotes = [];
+  }
+  const luauScan = scanLuauWorkspace(options.targetPath || root);
+  const scannedPaths = new Set((luauScan.files || []).map((f) => f.filePath));
+  const brainPaths = new Set(
+    (brainNotes || [])
+      .filter((n) => n.filePath)
+      .map((n) => n.filePath)
+  );
+  let covered = 0;
+  for (const p of scannedPaths) {
+    for (const bp of brainPaths) {
+      if (p.includes(bp) || bp.includes(p)) {
+        covered++;
+        break;
+      }
+    }
+  }
+  const total = scannedPaths.size || 1;
+  const coverage = Math.round((covered / total) * 100);
+  const pass = coverage >= requireBrainCoverage;
+  return {
+    check: 'brain-coverage-min',
+    pass,
+    severity: 'warning',
+    detail: `Brain coverage: ${coverage}% (minimum: ${requireBrainCoverage}%, ${covered}/${total} scanned files have brain notes)`,
+    brainCoverage: coverage,
+  };
+}
+
 function checkDeprecatedApi(scan) {
   const deprecated = [];
   const deprecatedPatterns = [
@@ -560,17 +669,22 @@ function checkSecurityFindings(scan) {
 }
 
 export async function gateWorkspace(root, options = {}) {
+  const resolved = resolveGateOptions(options);
   const {
     baselinePath,
     targetPath,
-    maxRiskDelta = 5,
-    minPcallCoverage = 80,
-    maxNewRisks = 3,
-    requireBaseline = false,
     checks,
     autoFix = false,
     fixable = ['deprecated-api', 'pcall-coverage', 'orphaned-connections'],
-  } = options;
+  } = resolved;
+  const {
+    maxRiskDelta,
+    minPcallCoverage,
+    maxNewRisks,
+    requireBaseline,
+    maxLocalPressure,
+    requireBrainCoverage,
+  } = resolved;
 
   const resolvedTarget = targetPath
     ? (path.isAbsolute(targetPath) ? targetPath : path.resolve(root, targetPath))
@@ -584,9 +698,11 @@ export async function gateWorkspace(root, options = {}) {
     'risk-threshold': () => checkRiskThreshold(scan, { maxNewRisks }),
     'risk-delta': () => checkRiskDelta(root, { baselinePath, maxRiskDelta, targetPath }),
     'pcall-coverage': () => checkPcallCoverage(scan, { minPcallCoverage }),
-    'local-pressure': () => checkLocalPressure(scan),
+    'local-pressure': () => checkLocalPressure(scan, { maxLocalPressure }),
+    'local-pressure-critical': () => checkLocalPressureCritical(scan),
     'orphaned-connections': () => checkOrphanedConnections(scan),
     'brain-coverage': () => checkBrainCoverage(root, { targetPath }),
+    'brain-coverage-min': () => checkBrainCoverageMin(root, { requireBrainCoverage, targetPath }),
     'deprecated-api': () => checkDeprecatedApi(scan),
     'security-findings': () => checkSecurityFindings(scan),
   };
